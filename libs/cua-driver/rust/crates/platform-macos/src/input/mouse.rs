@@ -103,6 +103,7 @@ fn click_at_xy_desktop_inner(
 ) -> anyhow::Result<()> {
     use core_graphics::display::CGDisplay;
     use core_graphics::event::CGEventTapLocation;
+    super::pointer::guard_event_point(x, y)?;
     let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
         .map_err(|_| anyhow::anyhow!("CGEventSource::new failed"))?;
     let prior = if preserve_cursor {
@@ -155,11 +156,15 @@ fn click_at_xy_desktop_inner(
             )
             .map_err(|_| anyhow::anyhow!("CGEvent::new_mouse_event(move) failed"))?;
             moved.set_flags(flags);
+            super::pointer::guard_event_point(x, y)?;
             moved.post(CGEventTapLocation::HID);
             std::thread::sleep(std::time::Duration::from_millis(12));
         }
 
         for pair_index in 0..count.max(1) {
+            super::pointer::guard_event_point(x, y)?;
+            let up = CGEvent::new_mouse_event(source.clone(), up_ty, point, btn)
+                .map_err(|_| anyhow::anyhow!("CGEvent::new_mouse_event(up) failed"))?;
             let down = CGEvent::new_mouse_event(source.clone(), down_ty, point, btn)
                 .map_err(|_| anyhow::anyhow!("CGEvent::new_mouse_event(down) failed"))?;
             down.set_flags(flags);
@@ -169,8 +174,16 @@ fn click_at_xy_desktop_inner(
             );
             down.post(CGEventTapLocation::HID);
             std::thread::sleep(std::time::Duration::from_millis(28));
-            let up = CGEvent::new_mouse_event(source.clone(), up_ty, point, btn)
-                .map_err(|_| anyhow::anyhow!("CGEvent::new_mouse_event(up) failed"))?;
+            if let Err(error) = super::pointer::guard_event_point(x, y) {
+                if let Some((pid, wid)) = super::pointer::current_target() {
+                    if let Err(cleanup) = release_guarded_button(pid, wid, up_ty, btn, point) {
+                        return Err(anyhow::anyhow!(
+                            "{error}; button release cleanup failed: {cleanup}"
+                        ));
+                    }
+                }
+                return Err(error);
+            }
             up.set_flags(flags);
             up.set_integer_value_field(
                 core_graphics::event::EventField::MOUSE_EVENT_CLICK_STATE,
@@ -192,6 +205,25 @@ fn click_at_xy_desktop_inner(
         unsafe { CGAssociateMouseAndMouseCursorPosition(true) };
     }
     result
+}
+
+/// Cancel tracking in the addressed app, then release only at a newly proven
+/// point in the same window. Used after a foreground gesture loses its hit.
+fn release_guarded_button(
+    pid: i32,
+    wid: u32,
+    up_type: CGEventType,
+    button: CGMouseButton,
+    last: CGPoint,
+) -> anyhow::Result<()> {
+    let _ = super::keyboard::press_key_no_auth(pid, "Escape", &[]);
+    let (x, y) = super::pointer::release_point(pid, wid, (last.x, last.y))?;
+    super::pointer::guard_event_point(x, y)?;
+    let event = new_global_mouse_event(up_type, CGPoint::new(x, y), button)
+        .map_err(|_| anyhow::anyhow!("mouse-up cleanup construction failed"))?;
+    event.post(core_graphics::event::CGEventTapLocation::HID);
+    std::thread::sleep(std::time::Duration::from_millis(40));
+    Ok(())
 }
 
 /// Move the real hardware cursor to a logical desktop point.
@@ -317,6 +349,9 @@ fn click_at_xy_inner(
     modifiers: &[&str],
     post_mode: MousePostMode,
 ) -> anyhow::Result<()> {
+    // 0.29.1 already takes screen coordinates as `x` and `y`. The guard is the
+    // same check 0.32.0 runs after unpacking its screen tuple.
+    super::pointer::guard_event_point(x, y)?;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
@@ -350,8 +385,16 @@ fn click_at_xy_inner(
         std::thread::sleep(std::time::Duration::from_millis(12));
 
         for pair_index in 0..count {
+            super::pointer::guard_event_point(x, y)?;
             let click_state = (pair_index + 1) as i64;
 
+            let up = CGEvent::new_mouse_event(
+                source.clone(),
+                CGEventType::LeftMouseUp,
+                point,
+                CGMouseButton::Left,
+            )
+            .map_err(|_| anyhow::anyhow!("CGEvent::new_mouse_event(up) failed"))?;
             let down = CGEvent::new_mouse_event(
                 source.clone(),
                 CGEventType::LeftMouseDown,
@@ -379,17 +422,14 @@ fn click_at_xy_inner(
             // gap can race the loop's first poll and the click is dropped.
             std::thread::sleep(std::time::Duration::from_millis(28));
 
-            let up = CGEvent::new_mouse_event(
-                source.clone(),
-                CGEventType::LeftMouseUp,
-                point,
-                CGMouseButton::Left,
-            )
-            .map_err(|_| anyhow::anyhow!("CGEvent::new_mouse_event(up) failed"))?;
             if flags != CGEventFlags::CGEventFlagNull {
                 up.set_flags(flags);
             }
 
+            if let Err(error) = super::pointer::guard_event_point(x, y) {
+                up.post_to_pid(pid);
+                return Err(error);
+            }
             post_mouse_event_with_mode(
                 pid,
                 &up,
@@ -870,6 +910,7 @@ fn post_drag_mouse_event(
     error_context: &str,
 ) -> anyhow::Result<()> {
     debug_assert_eq!(mode, MousePostMode::HidOnly);
+    super::pointer::guard_event_point(point.x, point.y)?;
     let event = new_global_mouse_event(event_type, point, button)
         .map_err(|_| anyhow::anyhow!(error_context.to_owned()))?;
     if flags != CGEventFlags::CGEventFlagNull {
@@ -948,8 +989,11 @@ where
     };
     let events = foreground_drag_events(from_x, from_y, to_x, to_y, steps);
 
-    super::keyboard::with_global_modifier_keys(modifiers, |flags| {
+    let mut button_down = false;
+    let mut last_point = CGPoint::new(from_x, from_y);
+    let result = super::keyboard::with_global_modifier_keys(modifiers, |flags| {
         for spec in events {
+            super::pointer::guard_event_point(spec.point.x, spec.point.y)?;
             let (event_type, click_state, event_button, event_button_number, subtype) = match spec
                 .kind
             {
@@ -998,6 +1042,13 @@ where
                 "foreground drag event creation failed",
             )?;
 
+            last_point = spec.point;
+            if spec.kind == ForegroundDragEventKind::Down {
+                button_down = true;
+            }
+            if spec.kind == ForegroundDragEventKind::Up {
+                button_down = false;
+            }
             match spec.kind {
                 ForegroundDragEventKind::Move => {
                     std::thread::sleep(std::time::Duration::from_millis(12));
@@ -1016,7 +1067,19 @@ where
             }
         }
         Ok(())
-    })?;
+    });
+    if button_down {
+        let cleanup = wid
+            .ok_or_else(|| anyhow::anyhow!("drag lost its target window"))
+            .and_then(|wid| release_guarded_button(pid, wid, up_type, cg_button, last_point));
+        if let Err(cleanup) = cleanup {
+            return Err(anyhow::anyhow!(
+                "{}; button release cleanup failed: {cleanup}",
+                result.unwrap_err()
+            ));
+        }
+    }
+    result?;
 
     std::thread::sleep(std::time::Duration::from_millis(100));
     Ok(())
@@ -1553,6 +1616,7 @@ pub fn scroll_wheel_at_xy(
     ticks: usize,
 ) -> anyhow::Result<()> {
     use core_graphics::event::ScrollEventUnit;
+    super::pointer::guard_event_point(screen_x, screen_y)?;
 
     // Prime AppKit/WebKit's tracking state at the target before the wheel
     // gesture. Background windows can retain a stale hit-test location; a
@@ -1577,6 +1641,7 @@ pub fn scroll_wheel_at_xy(
     std::thread::sleep(std::time::Duration::from_millis(12));
 
     for _ in 0..ticks.max(1) {
+        super::pointer::guard_event_point(screen_x, screen_y)?;
         // Fresh source per event, matching the click primitives.
         let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
             .map_err(|_| anyhow::anyhow!("CGEventSource::new failed"))?;

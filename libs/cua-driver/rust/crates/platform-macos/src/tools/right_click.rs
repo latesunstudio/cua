@@ -83,6 +83,7 @@ impl Tool for RightClickTool {
     }
 
     async fn invoke(&self, args: Value) -> ToolResult {
+        super::note_foreground_request("right_click", &args);
         use cua_driver_core::tool_args::ArgsExt;
         let pid = match args.require_i32("pid") {
             Ok(v) => v,
@@ -264,12 +265,15 @@ impl Tool for RightClickTool {
                     crate::input::mouse::right_click_at_xy(pid, screen_x, screen_y, &m)
                 }
             };
-            // Foreground rung: brief front → right-click → restore prior frontmost.
+            // 0.29.1 foreground right-click is the assist rung, not a
+            // PixelClickRoute. Arm the same hit guard before posting.
             match (fg, window_id) {
-                (true, Some(wid)) => {
-                    crate::input::skylight::with_foreground_assist(pid as libc::pid_t, wid, do_it)?;
-                    Ok(())
-                }
+                (true, Some(wid)) => crate::input::skylight::with_foreground_pointer_activation(
+                    pid as libc::pid_t,
+                    wid,
+                    &[(screen_x, screen_y)],
+                    do_it,
+                ),
                 _ => do_it(),
             }
         })

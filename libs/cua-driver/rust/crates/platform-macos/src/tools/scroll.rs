@@ -114,6 +114,7 @@ impl Tool for ScrollTool {
     }
 
     async fn invoke(&self, args: Value) -> ToolResult {
+        super::note_foreground_request("scroll", &args);
         use cua_driver_core::tool_args::ArgsExt;
         if args.opt_str("scope").as_deref() == Some("desktop")
             && args.get("pid").is_none()
@@ -508,7 +509,12 @@ impl Tool for ScrollTool {
             );
 
             let prior_front = apps::frontmost_pid();
-            let snapshot = WindowChangeDetector::snapshot(prior_front);
+            let fg = delivery_mode.is_foreground() && target.wid.is_some();
+            let snapshot = if fg {
+                WindowChangeDetector::snapshot_allowing_activation(prior_front, pid)
+            } else {
+                WindowChangeDetector::snapshot(prior_front)
+            };
 
             let WheelTarget {
                 screen_x,
@@ -517,9 +523,8 @@ impl Tool for ScrollTool {
                 wid,
             } = target;
             let amount_ticks = amount;
-            let fg = delivery_mode.is_foreground() && wid.is_some();
             let result = focus_guard::with_focus_suppressed(
-                Some(pid),
+                if fg { None } else { Some(pid) },
                 prior_front,
                 "scroll.CGScrollWheel",
                 || async move {
@@ -539,9 +544,10 @@ impl Tool for ScrollTool {
                         // Foreground rung: brief front → wheel → restore prior frontmost.
                         match (fg, wid) {
                             (true, Some(w)) => {
-                                crate::input::skylight::with_foreground_assist(
+                                crate::input::skylight::with_foreground_pointer_activation(
                                     pid as libc::pid_t,
                                     w,
+                                    &[(screen_x, screen_y)],
                                     do_it,
                                 )?;
                                 Ok(())

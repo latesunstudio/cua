@@ -359,11 +359,20 @@ fn release_pid_modifiers(
 /// queue. This is the desktop-scope counterpart to PID-routed `type_text` and
 /// mirrors computer-server's frontmost pynput typing behavior.
 pub fn type_text_global(text: &str, inter_char_delay_ms: u64) -> anyhow::Result<()> {
-    use core_graphics::event::CGEventTapLocation;
+    type_text_global_checked(text, inter_char_delay_ms, None).map(|_| ())
+}
 
+/// Stop before the next character when the app that owns a focused sequence
+/// is no longer frontmost. Return progress so retrying cannot duplicate a prefix.
+pub fn type_text_global_checked(
+    text: &str,
+    inter_char_delay_ms: u64,
+    expected_pid: Option<i32>,
+) -> anyhow::Result<usize> {
+    use core_graphics::event::CGEventTapLocation;
     let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
         .map_err(|_| anyhow::anyhow!("CGEventSource::new failed"))?;
-    for ch in text.chars() {
+    deliver_text_checked(text, expected_pid, crate::apps::frontmost_pid, |ch| {
         let value = ch.to_string();
         let down = CGEvent::new_keyboard_event(source.clone(), 0, true)
             .map_err(|_| anyhow::anyhow!("CGEvent keyboard down failed"))?;
@@ -377,8 +386,25 @@ pub fn type_text_global(text: &str, inter_char_delay_ms: u64) -> anyhow::Result<
         up.set_flags(CGEventFlags::CGEventFlagNull);
         up.post(CGEventTapLocation::HID);
         std::thread::sleep(std::time::Duration::from_millis(inter_char_delay_ms.max(8)));
+        Ok(())
+    })
+}
+
+fn deliver_text_checked(
+    text: &str,
+    expected_pid: Option<i32>,
+    mut active_pid: impl FnMut() -> Option<i32>,
+    mut emit: impl FnMut(char) -> anyhow::Result<()>,
+) -> anyhow::Result<usize> {
+    let mut delivered = 0;
+    for ch in text.chars() {
+        if expected_pid.is_some() && active_pid() != expected_pid {
+            break;
+        }
+        emit(ch)?;
+        delivered += 1;
     }
-    Ok(())
+    Ok(delivered)
 }
 
 /// Type ASCII text through the global HID queue as physical US-keyboard
@@ -881,5 +907,49 @@ mod tests {
         assert!(is_screen_sharing_bundle_id("com.apple.ScreenSharing"));
         assert!(!is_screen_sharing_bundle_id("com.apple.screensharing"));
         assert!(!is_screen_sharing_bundle_id("com.microsoft.rdc.macos"));
+    }
+}
+
+#[cfg(test)]
+mod focused_desktop_tests {
+    use super::deliver_text_checked;
+    use std::cell::Cell;
+
+    #[test]
+    fn stops_before_typing_into_the_next_app_and_reports_unicode_progress() {
+        let active = Cell::new(Some(11));
+        let mut emitted = String::new();
+        let delivered = deliver_text_checked(
+            "éabc",
+            Some(11),
+            || active.get(),
+            |ch| {
+                emitted.push(ch);
+                if emitted.chars().count() == 2 {
+                    active.set(Some(22));
+                }
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(emitted, "éa");
+        assert_eq!(delivered, 2);
+    }
+
+    #[test]
+    fn refuses_before_the_first_character_when_focus_is_unproven() {
+        let mut emitted = false;
+        let delivered = deliver_text_checked(
+            "fixture",
+            Some(11),
+            || None,
+            |_| {
+                emitted = true;
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(delivered, 0);
+        assert!(!emitted);
     }
 }

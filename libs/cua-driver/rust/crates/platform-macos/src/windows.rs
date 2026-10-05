@@ -98,6 +98,16 @@ fn all_windows_any_layer() -> Vec<WindowInfo> {
     enumerate_windows(kCGWindowListExcludeDesktopElements, LayerFilter::AnyLayer).windows
 }
 
+/// Fresh on-screen identity/geometry for validating the native AX hit recipient.
+/// All layers are included so an exact panel identity is never hidden here.
+pub(crate) fn pointer_hit_windows() -> Vec<WindowInfo> {
+    enumerate_windows(
+        kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements,
+        LayerFilter::AnyLayer,
+    )
+    .windows
+}
+
 /// Which CGWindow layers an enumeration admits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LayerFilter {

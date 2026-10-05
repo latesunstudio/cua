@@ -74,6 +74,7 @@ impl Tool for DoubleClickTool {
     }
 
     async fn invoke(&self, args: Value) -> ToolResult {
+        super::note_foreground_request("double_click", &args);
         use cua_driver_core::tool_args::ArgsExt;
         let pid = match args.require_i32("pid") {
             Ok(v) => v,
@@ -265,12 +266,14 @@ impl Tool for DoubleClickTool {
                     crate::input::mouse::click_at_xy(pid, screen_x, screen_y, 2, &[])
                 }
             };
-            // Foreground rung: brief front → double-click → restore prior frontmost.
+            // 0.29.1 foreground double-click is the assist rung, not a
+            // PixelClickRoute. Arm the same hit guard before posting.
             match (fg, window_id) {
                 (true, Some(wid)) => {
-                    crate::input::skylight::with_foreground_assist(
+                    crate::input::skylight::with_foreground_pointer_activation(
                         pid as libc::pid_t,
                         wid,
+                        &[(screen_x, screen_y)],
                         do_click,
                     )?;
                     Ok(())

@@ -32,19 +32,30 @@ const MAX_ANCESTRY_DEPTH: usize = 40;
 /// `element` must be a valid `AXUIElementRef` for the duration of the call.
 pub unsafe fn element_window_id(element: AXUIElementRef) -> Option<u32> {
     if let Some(window) = copy_element_attr(element, "AXWindow") {
-        let window_id = ax_get_window_id(window);
+        // A sheet reports itself as its controls' AXWindow, but it belongs to
+        // the document window it is attached to.
+        let window_id = if copy_string_attr(window, "AXRole").as_deref() == Some("AXSheet") {
+            top_level_window_id(window)
+        } else {
+            ax_get_window_id(window)
+        };
         CFRelease(window as CFTypeRef);
         if window_id.is_some() {
             return window_id;
         }
     }
-    // Fallback: ascend AXParent until a window role, then map it.
+    top_level_window_id(element)
+}
+
+/// Ascend `AXParent` to the first `AXWindow`, through any attached sheets, and
+/// map it to its CGWindowID.
+unsafe fn top_level_window_id(element: AXUIElementRef) -> Option<u32> {
     let mut current: AXUIElementRef = element;
     let mut owned = false;
     let mut resolved = None;
     for _ in 0..MAX_ANCESTRY_DEPTH {
         match copy_string_attr(current, "AXRole").as_deref() {
-            Some("AXWindow") | Some("AXSheet") => {
+            Some("AXWindow") => {
                 resolved = ax_get_window_id(current);
                 break;
             }
