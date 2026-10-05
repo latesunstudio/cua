@@ -109,6 +109,24 @@ unsafe fn resolve_exact_prefix(
             }
         }
 
+        // AppKit keeps hidden alternates and disabled duplicates under the
+        // same title; when exactly one candidate is enabled, it is the item a
+        // person could choose.
+        if matches.len() > 1 {
+            let (enabled, disabled): (Vec<_>, Vec<_>) = matches
+                .into_iter()
+                .partition(|item| copy_bool_attr(*item, "AXEnabled") != Some(false));
+            for item in &disabled {
+                CFRelease(*item as CFTypeRef);
+            }
+            matches = enabled;
+            // Hidden alternates stay enabled under the visible title; the
+            // visible item comes first in the menu.
+            while matches.len() > 1 {
+                let extra = matches.pop().expect("more than one match");
+                CFRelease(extra as CFTypeRef);
+            }
+        }
         if matches.len() != 1 {
             let match_count = matches.len();
             for candidate in matches {
@@ -141,54 +159,131 @@ fn choose_action(actions: &[String], final_segment: bool) -> Option<&'static str
     order.iter().copied().find(|action| supports(action))
 }
 
-unsafe fn invoke_path(pid: i32, path: &[String]) -> Result<(), String> {
-    let app = AXUIElementCreateApplication(pid);
-    if app.is_null() {
-        return Err("invoke_menu: target application is unavailable".into());
-    }
-    set_messaging_timeout(app);
+// The transaction owns any menu tracking it starts. Keep cleanup in the same
+// path executor as traversal so every failure runs it before focus restoration.
+trait MenuBackend {
+    type Target;
+    fn resolve(&mut self, prefix: &[String]) -> Result<Self::Target, String>;
+    fn enabled(&self, target: &Self::Target) -> bool;
+    fn actions(&self, target: &Self::Target) -> Vec<String>;
+    fn perform(&mut self, target: &Self::Target, action: &str) -> i32;
+    fn release(&mut self, target: Self::Target);
+    fn cancel_tracking(&mut self) -> Result<(), String>;
+    fn settle(&self);
+}
 
+fn execute_menu_path(backend: &mut impl MenuBackend, path: &[String]) -> Result<(), String> {
+    let mut dispatched = false;
     let result = (|| {
         for depth in 0..path.len() {
-            // Resolve from the live app root for every hop. Opening a menu can
-            // replace its AX objects and reorder unrelated snapshot indices.
-            let menu_bar = copy_element_attr(app, "AXMenuBar")
-                .ok_or_else(|| "invoke_menu: target exposes no AXMenuBar".to_owned())?;
-            set_messaging_timeout(menu_bar);
-            let target = resolve_exact_prefix(menu_bar, &path[..=depth]);
-            CFRelease(menu_bar as CFTypeRef);
-            let target = target?;
-            set_messaging_timeout(target);
-
-            if copy_bool_attr(target, "AXEnabled") == Some(false) {
-                CFRelease(target as CFTypeRef);
+            let target = backend.resolve(&path[..=depth])?;
+            if !backend.enabled(&target) {
+                backend.release(target);
                 return Err(format!("invoke_menu: path segment {depth} is disabled"));
             }
-            let actions = copy_action_names(target);
-            let action = choose_action(&actions, depth + 1 == path.len()).ok_or_else(|| {
-                format!("invoke_menu: path segment {depth} has no usable native menu action")
-            });
-            let action = match action {
-                Ok(action) => action,
-                Err(error) => {
-                    CFRelease(target as CFTypeRef);
-                    return Err(error);
-                }
+            let actions = backend.actions(&target);
+            let Some(action) = choose_action(&actions, depth + 1 == path.len()) else {
+                backend.release(target);
+                return Err(format!(
+                    "invoke_menu: path segment {depth} has no usable native menu action"
+                ));
             };
-            let error = perform_action(target, action);
-            CFRelease(target as CFTypeRef);
+            // Even a failed native dispatch can have opened menu tracking.
+            dispatched = true;
+            let error = backend.perform(&target, action);
+            backend.release(target);
             if error != kAXErrorSuccess {
                 return Err(format!(
                     "invoke_menu: native action for path segment {depth} failed with AX error {error}"
                 ));
             }
             if depth + 1 != path.len() {
-                std::thread::sleep(Duration::from_millis(80));
+                backend.settle();
             }
         }
         Ok(())
     })();
+    if dispatched && result.is_err() {
+        if let Err(cleanup) = backend.cancel_tracking() {
+            return Err(format!(
+                "{}; menu cleanup failed: {cleanup}",
+                result.unwrap_err()
+            ));
+        }
+    }
+    result
+}
 
+struct NativeMenuBackend {
+    app: AXUIElementRef,
+}
+
+impl MenuBackend for NativeMenuBackend {
+    type Target = AXUIElementRef;
+
+    fn resolve(&mut self, prefix: &[String]) -> Result<Self::Target, String> {
+        unsafe {
+            // Opening a menu can replace its AX objects; resolve each hop
+            // from a fresh application menu bar, never snapshot indices.
+            let bar = copy_element_attr(self.app, "AXMenuBar")
+                .ok_or_else(|| "invoke_menu: target exposes no AXMenuBar".to_owned())?;
+            set_messaging_timeout(bar);
+            let target = resolve_exact_prefix(bar, prefix);
+            CFRelease(bar as CFTypeRef);
+            if let Ok(target) = target {
+                set_messaging_timeout(target);
+            }
+            target
+        }
+    }
+
+    fn enabled(&self, target: &Self::Target) -> bool {
+        unsafe { copy_bool_attr(*target, "AXEnabled") != Some(false) }
+    }
+
+    fn actions(&self, target: &Self::Target) -> Vec<String> {
+        unsafe { copy_action_names(*target) }
+    }
+
+    fn perform(&mut self, target: &Self::Target, action: &str) -> i32 {
+        unsafe { perform_action(*target, action) }
+    }
+
+    fn release(&mut self, target: Self::Target) {
+        unsafe { CFRelease(target as CFTypeRef) }
+    }
+
+    fn cancel_tracking(&mut self) -> Result<(), String> {
+        unsafe {
+            // AXCancel on this app's menu bar dismisses its entire tracking
+            // session, including submenus. It cannot send Escape to another
+            // app, and is only called after this invocation dispatched a hop.
+            let bar = copy_element_attr(self.app, "AXMenuBar")
+                .ok_or_else(|| "target exposes no AXMenuBar for AXCancel".to_owned())?;
+            set_messaging_timeout(bar);
+            let error = perform_action(bar, "AXCancel");
+            CFRelease(bar as CFTypeRef);
+            if error != kAXErrorSuccess {
+                return Err(format!("AXCancel failed with AX error {error}"));
+            }
+        }
+        // Let AppKit leave menu tracking before the caller restores focus.
+        self.settle();
+        Ok(())
+    }
+
+    fn settle(&self) {
+        std::thread::sleep(Duration::from_millis(80));
+    }
+}
+
+unsafe fn invoke_path(pid: i32, path: &[String]) -> Result<(), String> {
+    let app = AXUIElementCreateApplication(pid);
+    if app.is_null() {
+        return Err("invoke_menu: target application is unavailable".into());
+    }
+    set_messaging_timeout(app);
+    let result = execute_menu_path(&mut NativeMenuBackend { app }, path);
     CFRelease(app as CFTypeRef);
     result
 }
@@ -401,6 +496,7 @@ impl Tool for InvokeMenuTool {
     }
 
     async fn invoke(&self, args: Value) -> ToolResult {
+        super::note_foreground_request("invoke_menu", &args);
         let input: InvokeMenuInput =
             match cua_driver_core::tool_args::parse_typed_input("invoke_menu", args) {
                 Ok(input) => input,
@@ -480,6 +576,150 @@ impl Tool for InvokeMenuTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Clone)]
+    struct FakeItem {
+        enabled: bool,
+        actions: Vec<String>,
+        native_error: i32,
+    }
+
+    impl Default for FakeItem {
+        fn default() -> Self {
+            Self {
+                enabled: true,
+                actions: vec!["AXPress".into()],
+                native_error: 0,
+            }
+        }
+    }
+
+    struct FakeMenu {
+        items: Vec<Option<FakeItem>>,
+        tracking: bool,
+        cancellations: usize,
+        dispatches: usize,
+        releases: usize,
+        cleanup_error: bool,
+    }
+
+    impl FakeMenu {
+        fn new(items: Vec<Option<FakeItem>>) -> Self {
+            Self {
+                items,
+                tracking: false,
+                cancellations: 0,
+                dispatches: 0,
+                releases: 0,
+                cleanup_error: false,
+            }
+        }
+    }
+
+    impl MenuBackend for FakeMenu {
+        type Target = FakeItem;
+        fn resolve(&mut self, prefix: &[String]) -> Result<FakeItem, String> {
+            self.items[prefix.len() - 1].clone().ok_or_else(|| {
+                format!(
+                    "invoke_menu: path segment {} was not found",
+                    prefix.len() - 1
+                )
+            })
+        }
+        fn enabled(&self, target: &FakeItem) -> bool {
+            target.enabled
+        }
+        fn actions(&self, target: &FakeItem) -> Vec<String> {
+            target.actions.clone()
+        }
+        fn perform(&mut self, target: &FakeItem, _action: &str) -> i32 {
+            self.tracking = true;
+            self.dispatches += 1;
+            target.native_error
+        }
+        fn release(&mut self, _target: FakeItem) {
+            self.releases += 1;
+        }
+        fn cancel_tracking(&mut self) -> Result<(), String> {
+            self.cancellations += 1;
+            if self.cleanup_error {
+                return Err("AXCancel failed".into());
+            }
+            self.tracking = false;
+            Ok(())
+        }
+        fn settle(&self) {}
+    }
+
+    #[test]
+    fn failed_menu_paths_cancel_tracking_started_by_the_call() {
+        let path = vec!["File".into(), "Command".into()];
+        let failure_items = [
+            None,
+            Some(FakeItem {
+                enabled: false,
+                ..FakeItem::default()
+            }),
+            Some(FakeItem {
+                actions: vec![],
+                ..FakeItem::default()
+            }),
+            Some(FakeItem {
+                native_error: -25204,
+                ..FakeItem::default()
+            }),
+        ];
+        for failed_item in failure_items {
+            let mut menu = FakeMenu::new(vec![Some(FakeItem::default()), failed_item]);
+            let error = execute_menu_path(&mut menu, &path).unwrap_err();
+            assert!(error.contains("path segment 1"), "{error}");
+            assert_eq!(menu.cancellations, 1);
+            assert!(!menu.tracking);
+            assert_eq!(
+                menu.releases,
+                menu.dispatches.max(1)
+                    + usize::from(error.contains("disabled") || error.contains("no usable"))
+            );
+        }
+    }
+
+    #[test]
+    fn failed_first_native_action_also_cancels_possible_partial_tracking() {
+        let mut menu = FakeMenu::new(vec![Some(FakeItem {
+            native_error: -25204,
+            ..FakeItem::default()
+        })]);
+        assert!(execute_menu_path(&mut menu, &["File".into()]).is_err());
+        assert_eq!(menu.cancellations, 1);
+        assert!(!menu.tracking);
+    }
+
+    #[test]
+    fn unresolved_path_without_dispatch_preserves_existing_tracking() {
+        let mut menu = FakeMenu::new(vec![None]);
+        menu.tracking = true;
+        assert!(execute_menu_path(&mut menu, &["Missing".into()]).is_err());
+        assert_eq!(menu.cancellations, 0);
+        assert!(menu.tracking);
+    }
+
+    #[test]
+    fn successful_menu_command_is_not_cancelled() {
+        let mut menu = FakeMenu::new(vec![Some(FakeItem::default()); 3]);
+        execute_menu_path(&mut menu, &["File".into(), "Export".into(), "PDF".into()]).unwrap();
+        assert_eq!(menu.dispatches, 3);
+        assert_eq!(menu.releases, 3);
+        assert_eq!(menu.cancellations, 0);
+    }
+
+    #[test]
+    fn cleanup_failure_retains_the_original_path_error() {
+        let mut menu = FakeMenu::new(vec![Some(FakeItem::default()), None]);
+        menu.cleanup_error = true;
+        let error = execute_menu_path(&mut menu, &["File".into(), "Missing".into()]).unwrap_err();
+        assert!(error.contains("path segment 1 was not found"));
+        assert!(error.contains("menu cleanup failed: AXCancel failed"));
+    }
 
     #[test]
     fn path_normalization_rejects_empty_segments() {

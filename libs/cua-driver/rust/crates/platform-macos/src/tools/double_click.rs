@@ -72,6 +72,7 @@ impl Tool for DoubleClickTool {
     }
 
     async fn invoke(&self, args: Value) -> ToolResult {
+        super::note_foreground_request("double_click", &args);
         use cua_driver_core::tool_args::ArgsExt;
         let pid = match args.require_i32("pid") {
             Ok(v) => v,
@@ -269,9 +270,10 @@ impl Tool for DoubleClickTool {
             // window is proven focused.
             match (route, window_id) {
                 (super::pixel_route::PixelClickRoute::ForegroundHid, Some(wid)) => {
-                    crate::input::skylight::with_foreground_hid_activation(
+                    crate::input::skylight::with_foreground_pointer_activation(
                         pid as libc::pid_t,
                         wid,
+                        &[(screen_x, screen_y)],
                         do_click,
                     )
                 }

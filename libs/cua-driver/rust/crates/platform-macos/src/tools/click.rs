@@ -261,6 +261,7 @@ impl Tool for ClickTool {
     }
 
     async fn invoke(&self, args: Value) -> ToolResult {
+        super::note_foreground_request("click", &args);
         use cua_driver_core::tool_args::ArgsExt;
 
         // ── Window-less screen-absolute branch (scope="desktop") ──────
@@ -551,10 +552,11 @@ impl Tool for ClickTool {
                 let foreground = delivery_mode.is_foreground();
                 let result = tokio::task::spawn_blocking(move || {
                     let m: Vec<&str> = mods_owned.iter().map(String::as_str).collect();
-                    if foreground && !m.is_empty() {
-                        crate::input::skylight::with_foreground_hid_activation(
+                    if foreground {
+                        crate::input::skylight::with_foreground_pointer_activation(
                             pid as libc::pid_t,
                             wid,
+                            &[(cx, cy)],
                             || {
                                 crate::input::mouse::click_at_xy_desktop_with_modifiers_preserving_cursor(
                                     cx, cy, 1, "middle", &m,
@@ -688,7 +690,21 @@ impl Tool for ClickTool {
                                 std::thread::sleep(std::time::Duration::from_millis(150));
                                 Ok(())
                             };
-                            let fronted = if has_modifiers {
+                            let fronted = if has_modifiers && selection_pixel.is_some() {
+                                crate::input::skylight::with_foreground_pointer_activation(
+                                    pid as libc::pid_t,
+                                    wid,
+                                    &[selection_pixel
+                                        .map(|p| (p.screen_x, p.screen_y))
+                                        .ok_or_else(|| {
+                                            anyhow::anyhow!(
+                                                "modifier click has no proven element point"
+                                            )
+                                        })?],
+                                    action,
+                                )?;
+                                true
+                            } else if has_modifiers {
                                 crate::input::skylight::with_foreground_hid_activation(
                                     pid as libc::pid_t,
                                     wid,
@@ -1189,9 +1205,10 @@ impl Tool for ClickTool {
                         // window is AX-focused) or no input is sent.
                         match (route, window_id) {
                             (PixelClickRoute::ForegroundHid, Some(wid)) => {
-                                crate::input::skylight::with_foreground_hid_activation(
+                                crate::input::skylight::with_foreground_pointer_activation(
                                     pid as libc::pid_t,
                                     wid,
+                                    &[(screen_x, screen_y)],
                                     do_click,
                                 )
                             }

@@ -49,6 +49,118 @@ use std::sync::Arc;
 
 use crate::{ax::snapshot::Snapshots, cursor::state::CursorRegistry};
 
+/// Foreground calls supersede a background launch watchdog before attempting
+/// activation or dispatch. Desktop input targets the currently active app.
+fn foreground_request_pid(
+    tool: &str,
+    args: &serde_json::Value,
+    frontmost: impl FnOnce() -> Option<i32>,
+) -> Option<i32> {
+    let pid = args
+        .get("pid")
+        .and_then(serde_json::Value::as_i64)
+        .and_then(|pid| i32::try_from(pid).ok())
+        .filter(|pid| *pid > 0);
+    if tool == "bring_to_front"
+        || tool == "invoke_menu"
+        || args
+            .get("delivery_mode")
+            .and_then(serde_json::Value::as_str)
+            == Some("foreground")
+    {
+        if pid.is_some() {
+            return pid;
+        }
+    }
+    if pid.is_none() && args.get("scope").and_then(serde_json::Value::as_str) == Some("desktop") {
+        return args
+            .get("expected_pid")
+            .and_then(serde_json::Value::as_i64)
+            .and_then(|pid| i32::try_from(pid).ok())
+            .filter(|pid| *pid > 0)
+            .or_else(frontmost);
+    }
+    None
+}
+
+fn note_foreground_request(tool: &str, args: &serde_json::Value) {
+    if let Some(pid) = foreground_request_pid(tool, args, crate::apps::frontmost_pid) {
+        crate::focus_steal::FocusStealPreventer::note_foreground_request(pid);
+    }
+}
+
+#[cfg(test)]
+mod foreground_intent_tests {
+    use super::foreground_request_pid;
+    use serde_json::json;
+
+    #[test]
+    fn explicit_foreground_tools_cancel_for_their_target() {
+        for tool in ["bring_to_front", "invoke_menu"] {
+            assert_eq!(
+                foreground_request_pid(tool, &json!({"pid": 42}), || Some(7)),
+                Some(42)
+            );
+        }
+        for tool in [
+            "click",
+            "double_click",
+            "right_click",
+            "scroll",
+            "drag",
+            "type_text",
+            "type_text_chars",
+            "press_key",
+            "hotkey",
+        ] {
+            assert_eq!(
+                foreground_request_pid(
+                    tool,
+                    &json!({"pid": 42, "delivery_mode": "foreground"}),
+                    || Some(7)
+                ),
+                Some(42)
+            );
+            assert_eq!(
+                foreground_request_pid(
+                    tool,
+                    &json!({"pid": 42, "delivery_mode": "background"}),
+                    || Some(7)
+                ),
+                None
+            );
+            assert_eq!(
+                foreground_request_pid(tool, &json!({"pid": 42}), || Some(7)),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn desktop_input_targets_expected_or_current_app() {
+        assert_eq!(
+            foreground_request_pid(
+                "type_text",
+                &json!({"scope": "desktop", "expected_pid": 42}),
+                || Some(7)
+            ),
+            Some(42)
+        );
+        assert_eq!(
+            foreground_request_pid("press_key", &json!({"scope": "desktop"}), || Some(7)),
+            Some(7)
+        );
+        assert_eq!(
+            foreground_request_pid("click", &json!({"scope": "desktop"}), || None),
+            None
+        );
+        assert_eq!(
+            foreground_request_pid("bring_to_front", &json!({"pid": -1}), || Some(7)),
+            None
+        );
+    }
+}
+
 fn native_window_id(
     window_id: Option<u64>,
 ) -> Result<Option<u32>, cua_driver_core::protocol::ToolResult> {

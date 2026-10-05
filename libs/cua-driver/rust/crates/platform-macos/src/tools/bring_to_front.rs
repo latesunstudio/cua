@@ -9,7 +9,6 @@
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use core_foundation::base::{CFRelease, CFTypeRef};
 use core_graphics::display::CGDisplay;
 use cua_driver_core::{
     protocol::ToolResult,
@@ -18,10 +17,7 @@ use cua_driver_core::{
 use objc2_app_kit::{NSApplicationActivationOptions, NSRunningApplication};
 use serde_json::{json, Value};
 
-use crate::ax::bindings::{
-    ax_get_window_id, copy_ax_windows, perform_action, set_bool_attr_true,
-    AXUIElementCreateApplication,
-};
+use crate::input::pointer::raise_exact_ax_window;
 use crate::windows::{WindowBounds, WindowInfo};
 
 pub struct BringToFrontTool;
@@ -235,34 +231,6 @@ fn wait_for_exact_window(pid: i32, window_id: u32) -> ExactWindowObservation {
     }
 }
 
-/// Best-effort completion of the one exact-window request. This addresses only
-/// the requested AX window; it never orders every window owned by the process.
-fn raise_exact_ax_window(pid: i32, window_id: u32) -> bool {
-    unsafe {
-        let app = AXUIElementCreateApplication(pid);
-        if app.is_null() {
-            return false;
-        }
-        let mut target = None;
-        for window in copy_ax_windows(app) {
-            if target.is_none() && ax_get_window_id(window) == Some(window_id) {
-                target = Some(window);
-            } else {
-                CFRelease(window as CFTypeRef);
-            }
-        }
-        CFRelease(app as CFTypeRef);
-        let Some(target) = target else {
-            return false;
-        };
-        let raised = perform_action(target, "AXRaise") == 0;
-        let main = set_bool_attr_true(target, "AXMain") == 0;
-        let focused = set_bool_attr_true(target, "AXFocused") == 0;
-        CFRelease(target as CFTypeRef);
-        raised || main || focused
-    }
-}
-
 fn exact_result(
     pid: i32,
     window_id: u32,
@@ -332,6 +300,7 @@ impl Tool for BringToFrontTool {
     }
 
     async fn invoke(&self, args: Value) -> ToolResult {
+        super::note_foreground_request("bring_to_front", &args);
         let pid = match args.get("pid").and_then(Value::as_i64) {
             Some(p) => match libc::pid_t::try_from(p) {
                 Ok(pid) => pid,
