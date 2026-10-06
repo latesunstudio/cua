@@ -403,22 +403,28 @@ impl Tool for LaunchAppTool {
                     //   case ~10s of "I clicked Code and it didn't come
                     //   forward" — acceptable trade for an automation
                     //   scenario where the agent just launched it.
+                    // A later explicit foreground request cancels both observer
+                    // protection and manual polling for this pid. Register the
+                    // lease before spawning, so the task cannot re-arm it later.
                     if slow_launch_path {
                         let launched_pid = *pid;
                         let prior_pid = prior;
+                        let lease = crate::focus_steal::FocusStealPreventer::begin_launch_watchdog(
+                            launched_pid,
+                            prior_pid,
+                        );
                         tokio::spawn(async move {
-                            let _lease = crate::focus_steal::FocusStealPreventer::begin_suppression(
-                                Some(launched_pid),
-                                prior_pid,
-                                "LaunchAppTool.watchdog",
-                            );
                             let mut late_activations = 0u32;
                             for _ in 0..32 {
                                 // 32 × 250ms = 8s
                                 tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-                                if crate::apps::frontmost_pid() == Some(launched_pid) {
-                                    late_activations += 1;
-                                    let _ = crate::apps::activate_pid(prior_pid);
+                                if !lease.while_active(|| {
+                                    if crate::apps::frontmost_pid() == Some(launched_pid) {
+                                        late_activations += 1;
+                                        let _ = crate::apps::activate_pid(prior_pid);
+                                    }
+                                }) {
+                                    break;
                                 }
                             }
                             if late_activations > 0 {

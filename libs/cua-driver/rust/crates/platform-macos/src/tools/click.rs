@@ -51,11 +51,8 @@ static DEF: std::sync::OnceLock<ToolDef> = std::sync::OnceLock::new();
 /// Focus posture for the raw pixel transport after AX hit-testing has failed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PixelActivationPolicy {
-    /// Standard background delivery: suppress activation of the target.
+    /// Background delivery: suppress activation of the target pid.
     SuppressTarget,
-    /// Left-click with a concrete window: intentionally make the target
-    /// AppKit-active without raising it, while suppressing every other app.
-    AllowTargetWithoutRaise,
     /// Explicit foreground rung owns its brief activation and restoration.
     ForegroundAssist,
 }
@@ -185,6 +182,81 @@ fn settled_value(
     }
 }
 
+/// Foreground element middle-click has no AX action. It must install the
+/// thread-local pointer target; a bare HID activation leaves `guard_event_point`
+/// as a no-op, including when modifiers are empty.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ElementMiddleClickDispatch {
+    ForegroundPointer,
+    BackgroundPid,
+}
+
+fn element_middle_click_dispatch(foreground: bool) -> ElementMiddleClickDispatch {
+    if foreground {
+        ElementMiddleClickDispatch::ForegroundPointer
+    } else {
+        ElementMiddleClickDispatch::BackgroundPid
+    }
+}
+
+fn run_element_middle_click<R>(
+    foreground: bool,
+    pointer: impl FnOnce() -> R,
+    background: impl FnOnce() -> R,
+) -> R {
+    match element_middle_click_dispatch(foreground) {
+        ElementMiddleClickDispatch::ForegroundPointer => pointer(),
+        ElementMiddleClickDispatch::BackgroundPid => background(),
+    }
+}
+
+/// A modified selection fallback posts a pixel click. Only that branch installs
+/// the pointer target. Modifier key chords without a proven point stay on HID,
+/// and an unmodified AX press stays on the assist front.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ForegroundElementClickDispatch {
+    Pointer,
+    Hid,
+    Assist,
+}
+
+fn foreground_element_click_dispatch(
+    has_modifiers: bool,
+    has_selection_pixel: bool,
+) -> ForegroundElementClickDispatch {
+    if has_modifiers && has_selection_pixel {
+        ForegroundElementClickDispatch::Pointer
+    } else if has_modifiers {
+        ForegroundElementClickDispatch::Hid
+    } else {
+        ForegroundElementClickDispatch::Assist
+    }
+}
+
+fn run_foreground_element_click(
+    has_modifiers: bool,
+    selection_point: Option<(f64, f64)>,
+    pid: libc::pid_t,
+    wid: u32,
+    action: impl FnOnce() -> anyhow::Result<()>,
+) -> anyhow::Result<bool> {
+    match foreground_element_click_dispatch(has_modifiers, selection_point.is_some()) {
+        ForegroundElementClickDispatch::Pointer => {
+            let point = selection_point
+                .ok_or_else(|| anyhow::anyhow!("modifier click has no proven element point"))?;
+            crate::input::skylight::with_foreground_pointer_activation(pid, wid, &[point], action)?;
+            Ok(true)
+        }
+        ForegroundElementClickDispatch::Hid => {
+            crate::input::skylight::with_foreground_hid_activation(pid, wid, action)?;
+            Ok(true)
+        }
+        ForegroundElementClickDispatch::Assist => {
+            crate::input::skylight::with_foreground_assist(pid, wid, action)
+        }
+    }
+}
+
 fn pixel_activation_policy(
     button: &str,
     effective_foreground: bool,
@@ -192,34 +264,54 @@ fn pixel_activation_policy(
 ) -> PixelActivationPolicy {
     if effective_foreground {
         PixelActivationPolicy::ForegroundAssist
-    } else if button == "left" && has_window {
-        PixelActivationPolicy::AllowTargetWithoutRaise
     } else {
+        // Left, right, and middle share this lease. A window id does not
+        // authorize a private activation prelude.
+        let _ = (button, has_window);
         PixelActivationPolicy::SuppressTarget
     }
 }
 
-/// Return the prior foreground pid that should be restored after a raw
-/// background pixel click.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PixelSnapshotKind {
+    /// Ordinary suppression snapshot of the user's front process.
+    SuppressTarget,
+    /// Explicit foreground owns activation, so there is nothing to suppress.
+    ForegroundUnsuppressed,
+}
+
+/// What the pixel path may do to keyboard focus before posting.
 ///
-/// This decision deliberately depends on observed application state rather
-/// than the private focus recipe's return value. The recipe can be unavailable
-/// or partially fail while the raw click still makes the target AppKit-active;
-/// in that case the allow-target suppression lease will not restore it for us.
-fn background_pixel_restore_pid(
-    activation_policy: PixelActivationPolicy,
-    prior_front: Option<i32>,
-    target_pid: i32,
-    observed_front: Option<i32>,
-) -> Option<i32> {
-    if activation_policy == PixelActivationPolicy::AllowTargetWithoutRaise
-        && prior_front != Some(target_pid)
-        && observed_front == Some(target_pid)
-    {
-        prior_front
-    } else {
-        None
+/// Background delivery always suppresses the target pid and never activates
+/// it. The posted event's effect stays unverifiable; the caller reads it back.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PixelFocusLease {
+    snapshot: PixelSnapshotKind,
+    suppress_pid: Option<i32>,
+    activate_without_raise: bool,
+}
+
+fn pixel_focus_lease(policy: PixelActivationPolicy, target_pid: i32) -> PixelFocusLease {
+    match policy {
+        PixelActivationPolicy::SuppressTarget => PixelFocusLease {
+            snapshot: PixelSnapshotKind::SuppressTarget,
+            suppress_pid: Some(target_pid),
+            activate_without_raise: false,
+        },
+        PixelActivationPolicy::ForegroundAssist => PixelFocusLease {
+            snapshot: PixelSnapshotKind::ForegroundUnsuppressed,
+            suppress_pid: None,
+            activate_without_raise: false,
+        },
     }
+}
+
+fn pixel_post_structured(route: PixelClickRoute) -> serde_json::Value {
+    serde_json::json!({
+        "path": super::pixel_route::path_label(route),
+        "verified": false,
+        "effect": "unverifiable",
+    })
 }
 
 fn def() -> &'static ToolDef {
@@ -314,6 +406,7 @@ impl Tool for ClickTool {
     }
 
     async fn invoke(&self, args: Value) -> ToolResult {
+        super::note_foreground_request("click", &args);
         use cua_driver_core::tool_args::ArgsExt;
 
         // ── Window-less screen-absolute branch (scope="desktop") ──────
@@ -615,19 +708,22 @@ impl Tool for ClickTool {
                 let foreground = delivery_mode.is_foreground();
                 let result = tokio::task::spawn_blocking(move || {
                     let m: Vec<&str> = mods_owned.iter().map(String::as_str).collect();
-                    if foreground && !m.is_empty() {
-                        crate::input::skylight::with_foreground_hid_activation(
-                            pid as libc::pid_t,
-                            wid,
-                            || {
-                                crate::input::mouse::click_at_xy_desktop_with_modifiers_preserving_cursor(
-                                    cx, cy, 1, "middle", &m,
-                                )
-                            },
-                        )
-                    } else {
-                        crate::input::mouse::middle_click_at_xy(pid, cx, cy, &m)
-                    }
+                    run_element_middle_click(
+                        foreground,
+                        || {
+                            crate::input::skylight::with_foreground_pointer_activation(
+                                pid as libc::pid_t,
+                                wid,
+                                &[(cx, cy)],
+                                || {
+                                    crate::input::mouse::click_at_xy_desktop_with_modifiers_preserving_cursor(
+                                        cx, cy, 1, "middle", &m,
+                                    )
+                                },
+                            )
+                        },
+                        || crate::input::mouse::middle_click_at_xy(pid, cx, cy, &m),
+                    )
                 })
                 .await;
                 return match result {
@@ -758,20 +854,13 @@ impl Tool for ClickTool {
                                 std::thread::sleep(std::time::Duration::from_millis(150));
                                 Ok(())
                             };
-                            let fronted = if has_modifiers {
-                                crate::input::skylight::with_foreground_hid_activation(
-                                    pid as libc::pid_t,
-                                    wid,
-                                    action,
-                                )?;
-                                true
-                            } else {
-                                crate::input::skylight::with_foreground_assist(
-                                    pid as libc::pid_t,
-                                    wid,
-                                    action,
-                                )?
-                            };
+                            let fronted = run_foreground_element_click(
+                                has_modifiers,
+                                selection_pixel.map(|point| (point.screen_x, point.screen_y)),
+                                pid as libc::pid_t,
+                                wid,
+                                action,
+                            )?;
                             let outcome = outcome.ok_or_else(|| {
                                 anyhow::anyhow!("foreground AX click did not execute")
                             })?;
@@ -1129,57 +1218,25 @@ impl Tool for ClickTool {
                 Err(refusal) => return refusal,
             };
             let activation_policy = pixel_activation_policy(&button_str, fg, window_id.is_some());
+            let focus_lease = pixel_focus_lease(activation_policy, pid);
+            if focus_lease.activate_without_raise {
+                return ToolResult::error(
+                    "pixel click refused: this delivery does not activate the target".to_owned(),
+                );
+            }
 
-            // ── Focus-suppression wrap (Swift WindowChangeDetector + FocusGuard) ──
-            // A pixel click can land on a "Sign In" button that opens a sheet
-            // or a Safari link that activates a new tab — same side-effect
-            // shape as the AX path, so we wrap identically.
+            // A pixel click can land on a control that opens a sheet or a new
+            // tab. Background delivery, including left click on an exact
+            // window, uses the ordinary pid suppression snapshot and never
+            // posts a private activation record.
             let prior_front = apps::frontmost_pid();
-            let snapshot = match activation_policy {
-                PixelActivationPolicy::SuppressTarget => {
-                    WindowChangeDetector::snapshot(prior_front)
-                }
-                PixelActivationPolicy::AllowTargetWithoutRaise => {
-                    WindowChangeDetector::snapshot_allowing_activation(prior_front, pid)
-                }
-                PixelActivationPolicy::ForegroundAssist => {
+            let snapshot = match focus_lease.snapshot {
+                PixelSnapshotKind::SuppressTarget => WindowChangeDetector::snapshot(prior_front),
+                PixelSnapshotKind::ForegroundUnsuppressed => {
                     WindowChangeDetector::snapshot_without_suppression(prior_front)
                 }
             };
 
-            // Restore the Swift background-click prologue that was left
-            // disconnected in the original Rust port. It makes an opaque
-            // target AppKit-active without raising/restacking its window, which
-            // is required by Chromium gates and remote-HID proxies such as
-            // iPhone Mirroring. Re-pin after the focus record because changing
-            // AppKit active state can disturb overlay ordering.
-            let focus_without_raise =
-                if activation_policy == PixelActivationPolicy::AllowTargetWithoutRaise {
-                    let wid = window_id.expect("activation policy requires window_id");
-                    match tokio::task::spawn_blocking(move || {
-                        crate::input::mouse::prepare_background_pixel_click(pid, wid)
-                    })
-                    .await
-                    {
-                        Ok(activated) => {
-                            crate::cursor::overlay::send_command(
-                                cursor_key.clone(),
-                                cursor_overlay::OverlayCommand::PinAbove(wid as u64),
-                            );
-                            activated
-                        }
-                        Err(error) => {
-                            return ToolResult::error(format!(
-                                "Background click activation task failed: {error}"
-                            ));
-                        }
-                    }
-                } else {
-                    false
-                };
-
-            // Pulse only after the activation settle so it visually coincides
-            // with the real target click rather than the private focus prelude.
             crate::cursor::overlay::send_command(
                 cursor_key.clone(),
                 cursor_overlay::OverlayCommand::ClickPulse {
@@ -1189,16 +1246,11 @@ impl Tool for ClickTool {
             );
 
             let mods_owned = modifiers.clone();
-            // Surface 5: route to the right/middle CGEvent primitives when
-            // button != left. Left-button path stays on the existing Chromium-
-            // routed `click_at_xy_with_window_local` for back-compat.
+            // Right and middle stay on their existing primitives. Left uses
+            // the window-local public PID route when a window id is known.
             let button_kind = button_str.clone();
             let result = focus_guard::with_focus_suppressed(
-                if activation_policy == PixelActivationPolicy::SuppressTarget {
-                    Some(pid)
-                } else {
-                    None
-                },
+                focus_lease.suppress_pid,
                 prior_front,
                 "click.pixel",
                 || async move {
@@ -1235,12 +1287,10 @@ impl Tool for ClickTool {
                                     }
                                     crate::input::mouse::middle_click_at_xy(pid, screen_x, screen_y, &m)
                                 }
-                                // "left" (default) or anything else — preserve legacy left-click path.
+                                // "left" (default). Window-local delivery stamps the exact
+                                // local point on one public PID post. Foreground HID is
+                                // the branch above and is unchanged.
                                 _ => {
-                                    // When we know the window_id, use the targeted primitive so
-                                    // foreground delivery can stamp window-local coordinates and
-                                    // background delivery can retain the translated screen point
-                                    // while adding Chromium routing fields (f40, f51, f58, f91, f92).
                                     if let Some(wid) = window_id {
                                         return crate::input::mouse::click_at_xy_with_window_local(
                                             pid, screen_x, screen_y,
@@ -1259,9 +1309,10 @@ impl Tool for ClickTool {
                         // window is AX-focused) or no input is sent.
                         match (route, window_id) {
                             (PixelClickRoute::ForegroundHid, Some(wid)) => {
-                                crate::input::skylight::with_foreground_hid_activation(
+                                crate::input::skylight::with_foreground_pointer_activation(
                                     pid as libc::pid_t,
                                     wid,
+                                    &[(screen_x, screen_y)],
                                     do_click,
                                 )
                             }
@@ -1272,43 +1323,6 @@ impl Tool for ClickTool {
                 },
             )
             .await;
-
-            // The no-raise record can make NSWorkspace report the target as
-            // active even though its window never moved in z-order. Once the
-            // click has been queued, restore the prior app if the target is
-            // still reported frontmost. Base this on observed state, not
-            // `focus_without_raise`: the private recipe can report failure
-            // after partially activating the target, and the raw click can
-            // self-activate even when that recipe is unavailable. Do not
-            // overwrite a different app here; the wildcard suppression lease
-            // handles genuine side effects.
-            if activation_policy == PixelActivationPolicy::AllowTargetWithoutRaise
-                && prior_front != Some(pid)
-            {
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                if let Some(previous_pid) = background_pixel_restore_pid(
-                    activation_policy,
-                    prior_front,
-                    pid,
-                    apps::frontmost_pid(),
-                ) {
-                    let _ = apps::activate_pid(previous_pid);
-                } else if let (Some(previous_pid), Some(wid)) = (prior_front, window_id) {
-                    // The prior app is still frontmost, but the no-raise
-                    // recipe posted it a defocus record: hand its key window
-                    // focus back so the user's typing keeps landing there.
-                    if focus_without_raise && apps::frontmost_pid() == Some(previous_pid) {
-                        let _ = tokio::task::spawn_blocking(move || {
-                            crate::input::skylight::restore_focus_after_without_raise(
-                                previous_pid,
-                                pid,
-                                wid,
-                            )
-                        })
-                        .await;
-                    }
-                }
-            }
 
             let changes = super::finish_window_observation(snapshot).await;
 
@@ -1329,12 +1343,7 @@ impl Tool for ClickTool {
                         super::pixel_route::delivery_note(route),
                         changes.result_suffix()
                     ))
-                    .with_structured(serde_json::json!({
-                        "path": super::pixel_route::path_label(route),
-                        "verified": false,
-                        "effect": "unverifiable",
-                        "focus_without_raise": focus_without_raise
-                    }))
+                    .with_structured(pixel_post_structured(route))
                 }
                 Ok(Err(e)) if route == PixelClickRoute::ForegroundHid => {
                     super::pixel_route::foreground_unavailable(
@@ -1800,15 +1809,15 @@ mod tests {
         );
     }
 
-    /// Regression for the Swift→Rust port gap: only a raw background left
-    /// click with an exact window may intentionally activate the target
-    /// without raising it. Other background buttons retain strict suppression,
-    /// and the explicit foreground rung owns its separate activation.
+    /// Background left on an exact window uses the ordinary pid suppression
+    /// lease. It does not activate the target. The posted outcome stays
+    /// unverifiable until the caller reads the target back. Foreground keeps
+    /// its own unsuppressed assist lease.
     #[test]
-    fn raw_background_left_click_restores_focus_without_raise_policy() {
+    fn background_left_pixel_suppresses_pid_and_stays_unverifiable() {
         assert_eq!(
             pixel_activation_policy("left", false, true),
-            PixelActivationPolicy::AllowTargetWithoutRaise
+            PixelActivationPolicy::SuppressTarget
         );
         assert_eq!(
             pixel_activation_policy("left", false, false),
@@ -1826,43 +1835,64 @@ mod tests {
             pixel_activation_policy("left", true, true),
             PixelActivationPolicy::ForegroundAssist
         );
+
+        let background = pixel_focus_lease(pixel_activation_policy("left", false, true), 42);
+        assert_eq!(background.snapshot, PixelSnapshotKind::SuppressTarget);
+        assert_eq!(background.suppress_pid, Some(42));
+        assert!(
+            !background.activate_without_raise,
+            "background left must not borrow keyboard focus"
+        );
+
+        let foreground = pixel_focus_lease(pixel_activation_policy("left", true, true), 42);
+        assert_eq!(
+            foreground.snapshot,
+            PixelSnapshotKind::ForegroundUnsuppressed
+        );
+        assert_eq!(foreground.suppress_pid, None);
+        assert!(!foreground.activate_without_raise);
+
+        let posted = pixel_post_structured(PixelClickRoute::BackgroundPid);
+        assert_eq!(posted["effect"], "unverifiable");
+        assert_eq!(posted["verified"], false);
+        assert_eq!(posted["path"], "cgevent");
+        assert!(posted.get("focus_without_raise").is_none());
     }
 
-    /// The no-foreground contract must not depend on the private activation
-    /// recipe reporting full success. If that recipe is unavailable or only
-    /// partially succeeds but the target is nevertheless observed frontmost,
-    /// restore the user's prior app.
+    /// The element middle-click branch, with or without modifiers, is the
+    /// foreground pointer path. Background element middle-click stays pid-routed.
     #[test]
-    fn failed_private_activation_still_restores_observed_target_focus() {
+    fn foreground_element_middle_click_selects_pointer_guard() {
         assert_eq!(
-            background_pixel_restore_pid(
-                PixelActivationPolicy::AllowTargetWithoutRaise,
-                Some(7),
-                42,
-                Some(42),
-            ),
-            Some(7)
+            run_element_middle_click(true, || "pointer", || "background"),
+            "pointer"
         );
+        assert_eq!(
+            run_element_middle_click(false, || "pointer", || "background"),
+            "background"
+        );
+    }
 
+    /// Modified selection fallback is the only AX foreground branch that posts
+    /// a pixel click, so it is the only one that installs the pointer target.
+    #[test]
+    fn modified_selection_fallback_selects_pointer_guard() {
         assert_eq!(
-            background_pixel_restore_pid(
-                PixelActivationPolicy::AllowTargetWithoutRaise,
-                Some(7),
-                42,
-                Some(99),
-            ),
-            None,
-            "do not overwrite an unrelated app that became frontmost"
+            foreground_element_click_dispatch(true, true),
+            ForegroundElementClickDispatch::Pointer,
+            "run_foreground_element_click sends this arm through pointer activation"
         );
         assert_eq!(
-            background_pixel_restore_pid(
-                PixelActivationPolicy::SuppressTarget,
-                Some(7),
-                42,
-                Some(42),
-            ),
-            None,
-            "strict-suppression paths retain their existing ownership"
+            foreground_element_click_dispatch(true, false),
+            ForegroundElementClickDispatch::Hid
+        );
+        assert_eq!(
+            foreground_element_click_dispatch(false, true),
+            ForegroundElementClickDispatch::Assist
+        );
+        assert_eq!(
+            foreground_element_click_dispatch(false, false),
+            ForegroundElementClickDispatch::Assist
         );
     }
 }

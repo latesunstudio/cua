@@ -140,6 +140,7 @@ impl Tool for DragTool {
     }
 
     async fn invoke(&self, args: Value) -> ToolResult {
+        super::note_foreground_request("drag", &args);
         use cua_driver_core::tool_args::ArgsExt;
         let cursor_key = super::cursor_tools::resolve_cursor_key(&args);
         if args.opt_str("scope").as_deref() == Some("desktop")
@@ -354,9 +355,10 @@ impl Tool for DragTool {
                             // Keep the exact target window active for the
                             // complete HID gesture, then restore the prior
                             // front process.
-                            return crate::input::skylight::with_foreground_hid_activation(
+                            return crate::input::skylight::with_foreground_pointer_activation(
                                 pid as libc::pid_t,
                                 wid,
+                                &[(from_sx, from_sy), (to_sx, to_sy)],
                                 || {
                                     let observed_cursor = cursor_for_drag.clone();
                                     crate::input::mouse::drag_at_xy_observed(

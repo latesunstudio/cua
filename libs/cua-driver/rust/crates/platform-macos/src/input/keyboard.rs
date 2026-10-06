@@ -376,11 +376,20 @@ fn release_pid_modifiers(
 /// queue. This is the desktop-scope counterpart to PID-routed `type_text` and
 /// mirrors computer-server's frontmost pynput typing behavior.
 pub fn type_text_global(text: &str, inter_char_delay_ms: u64) -> anyhow::Result<()> {
-    use core_graphics::event::CGEventTapLocation;
+    type_text_global_checked(text, inter_char_delay_ms, None).map(|_| ())
+}
 
+/// Stop before the next character when the app that owns a focused sequence
+/// is no longer frontmost. The returned count is the prefix already posted.
+pub fn type_text_global_checked(
+    text: &str,
+    inter_char_delay_ms: u64,
+    expected_pid: Option<i32>,
+) -> anyhow::Result<usize> {
+    use core_graphics::event::CGEventTapLocation;
     let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
         .map_err(|_| anyhow::anyhow!("CGEventSource::new failed"))?;
-    for ch in text.chars() {
+    deliver_text_checked(text, expected_pid, crate::apps::frontmost_pid, |ch| {
         let value = ch.to_string();
         let down = CGEvent::new_keyboard_event(source.clone(), 0, true)
             .map_err(|_| anyhow::anyhow!("CGEvent keyboard down failed"))?;
@@ -394,8 +403,62 @@ pub fn type_text_global(text: &str, inter_char_delay_ms: u64) -> anyhow::Result<
         up.set_flags(CGEventFlags::CGEventFlagNull);
         up.post(CGEventTapLocation::HID);
         std::thread::sleep(std::time::Duration::from_millis(inter_char_delay_ms).max(key_gap()));
+        Ok(())
+    })
+}
+
+fn deliver_text_checked(
+    text: &str,
+    expected_pid: Option<i32>,
+    mut active_pid: impl FnMut() -> Option<i32>,
+    mut emit: impl FnMut(char) -> anyhow::Result<()>,
+) -> anyhow::Result<usize> {
+    let mut delivered = 0usize;
+    for ch in text.chars() {
+        if expected_pid.is_some() && active_pid() != expected_pid {
+            break;
+        }
+        emit(ch)?;
+        delivered += 1;
     }
-    Ok(())
+    Ok(delivered)
+}
+
+#[cfg(test)]
+mod deliver_text_tests {
+    use super::deliver_text_checked;
+
+    #[test]
+    fn stops_before_the_character_that_would_land_in_another_app() {
+        let mut seen = Vec::new();
+        let delivered = deliver_text_checked("abcd", Some(7), || Some(7), |ch| {
+            seen.push(ch);
+            if seen.len() == 2 {
+                // The next check observes the new frontmost app.
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(delivered, 4);
+        let front = std::cell::Cell::new(Some(7i32));
+        let delivered = deliver_text_checked(
+            "abcd",
+            Some(7),
+            || front.get(),
+            |ch| {
+                if ch == 'c' {
+                    front.set(Some(9));
+                }
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(delivered, 3);
+        let delivered = deliver_text_checked("ab", Some(7), || Some(9), |_| Ok(())).unwrap();
+        assert_eq!(delivered, 0);
+        let delivered = deliver_text_checked("ab", None, || Some(9), |_| Ok(())).unwrap();
+        assert_eq!(delivered, 2);
+    }
 }
 
 /// Type ASCII text through the global HID queue as physical US-keyboard

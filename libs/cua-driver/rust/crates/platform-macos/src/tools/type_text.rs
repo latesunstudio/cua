@@ -104,6 +104,7 @@ fn def() -> &'static ToolDef {
                 "element_token": cua_driver_core::tool_schema::element_token_schema(),
                 "x": { "type": "number", "description": "Screenshot-pixel X of the field to type into — the element px action form. Pass x,y (no element_token) and the tool pixel-clicks there to establish real renderer focus, then types. Use for Chromium/Electron inputs the AX path can't reach. Read straight off the get_window_state PNG, same convention as click." },
                 "y": { "type": "number", "description": "Screenshot-pixel Y of the field (see x)." },
+                "expected_pid": { "type": "integer", "minimum": 1, "description": "Desktop typing only: stop before the next character if this app is no longer frontmost; reports delivered_chars for safe suffix retry." },
                 "delay_ms": {
                     "type": "integer",
                     "minimum": 0,
@@ -159,6 +160,7 @@ impl Tool for TypeTextTool {
     }
 
     async fn invoke(&self, args: Value) -> ToolResult {
+        super::note_foreground_request("type_text", &args);
         use cua_driver_core::tool_args::ArgsExt;
         if args.opt_str("scope").as_deref() == Some("desktop")
             && args.get("pid").is_none()
@@ -179,17 +181,47 @@ impl Tool for TypeTextTool {
             ) {
                 return synthesis_refusal_result("hid", &refusal, AxAttempt::NotAttempted);
             }
+            let expected_pid = match args.get("expected_pid") {
+                None => None,
+                Some(value) => match value
+                    .as_i64()
+                    .and_then(|pid| i32::try_from(pid).ok())
+                    .filter(|pid| *pid > 0)
+                {
+                    Some(pid) => Some(pid),
+                    None => return ToolResult::error("expected_pid must be a positive process ID"),
+                },
+            };
+            let total_chars = text.chars().count();
             let result = tokio::task::spawn_blocking(move || {
-                crate::input::keyboard::type_text_global(&text, delay_ms)
+                crate::input::keyboard::type_text_global_checked(&text, delay_ms, expected_pid)
             })
             .await;
             return match result {
-                Ok(Ok(())) => {
+                Ok(Ok(delivered)) if delivered < total_chars => {
+                    ToolResult::error(format!(
+                        "Desktop typing stopped because focus moved: delivered {delivered} of {total_chars} character(s). Refocus the intended app and retry only the remaining suffix."
+                    ))
+                    .with_structured(serde_json::json!({
+                        "scope": "desktop",
+                        "route": "global_input",
+                        "path": "hid",
+                        "effect": if delivered == 0 { "refused" } else { "partial" },
+                        "code": "foreground_focus_changed",
+                        "expected_pid": expected_pid,
+                        "delivered_chars": delivered,
+                        "total_chars": total_chars,
+                        "escalation": { "recommended": "bring_to_front", "retry": "remaining_suffix_only" }
+                    }))
+                }
+                Ok(Ok(delivered)) => {
                     ToolResult::text("Typed text into the frontmost desktop application.")
                         .with_structured(serde_json::json!({
                             "scope": "desktop",
                             "path": "hid",
-                            "effect": "unverifiable"
+                            "effect": "unverifiable",
+                            "delivered_chars": delivered,
+                            "total_chars": total_chars
                         }))
                 }
                 Ok(Err(error)) => ToolResult::error(format!("desktop type_text failed: {error}")),

@@ -25,6 +25,62 @@ use super::ToolState;
 const WHEEL_STEP_LINE_PX: i32 = 120;
 const WHEEL_STEP_PAGE_PX: i32 = 600;
 
+/// Foreground wheel both installs the pointer target and lets the target's
+/// own activation through. Suppressing that pid would undo the front the
+/// wheel just requested.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WheelDispatch {
+    ForegroundPointerAllowing,
+    BackgroundSuppressed,
+}
+
+fn wheel_dispatch(foreground_requested: bool, has_window: bool) -> WheelDispatch {
+    if foreground_requested && has_window {
+        WheelDispatch::ForegroundPointerAllowing
+    } else {
+        WheelDispatch::BackgroundSuppressed
+    }
+}
+
+impl WheelDispatch {
+    fn allow_intended_activation(self) -> bool {
+        matches!(self, Self::ForegroundPointerAllowing)
+    }
+
+    /// `None` leaves the target's own activation alone. `Some(pid)` is the
+    /// background suppressor that would undo a foreground wheel.
+    fn suppression_target(self, pid: i32) -> Option<i32> {
+        if self.allow_intended_activation() {
+            None
+        } else {
+            Some(pid)
+        }
+    }
+}
+
+fn wheel_uses_pointer_guard(dispatch: WheelDispatch, has_window: bool) -> bool {
+    dispatch.allow_intended_activation() && has_window
+}
+
+fn run_wheel(
+    dispatch: WheelDispatch,
+    pid: i32,
+    wid: Option<u32>,
+    point: (f64, f64),
+    deliver: impl FnOnce() -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    if wheel_uses_pointer_guard(dispatch, wid.is_some()) {
+        crate::input::skylight::with_foreground_pointer_activation(
+            pid as libc::pid_t,
+            wid.expect("pointer-guard wheel has a window"),
+            &[point],
+            deliver,
+        )
+    } else {
+        deliver()
+    }
+}
+
 /// Resolved pixel-wheel target in screen space, plus optional window-local
 /// stamp + window id for backgrounded delivery.
 struct WheelTarget {
@@ -124,6 +180,7 @@ impl Tool for ScrollTool {
     }
 
     async fn invoke(&self, args: Value) -> ToolResult {
+        super::note_foreground_request("scroll", &args);
         use cua_driver_core::tool_args::ArgsExt;
         if args.opt_str("scope").as_deref() == Some("desktop")
             && args.get("pid").is_none()
@@ -514,7 +571,12 @@ impl Tool for ScrollTool {
             );
 
             let prior_front = apps::frontmost_pid();
-            let snapshot = WindowChangeDetector::snapshot(prior_front);
+            let dispatch = wheel_dispatch(delivery_mode.is_foreground(), target.wid.is_some());
+            let snapshot = if dispatch.allow_intended_activation() {
+                WindowChangeDetector::snapshot_allowing_activation(prior_front, pid)
+            } else {
+                WindowChangeDetector::snapshot(prior_front)
+            };
 
             let WheelTarget {
                 screen_x,
@@ -524,14 +586,15 @@ impl Tool for ScrollTool {
                 ..
             } = target;
             let amount_ticks = amount;
-            let fg = delivery_mode.is_foreground() && wid.is_some();
+            let fg = dispatch.allow_intended_activation();
+            let suppress = dispatch.suppression_target(pid);
             let result = focus_guard::with_focus_suppressed(
-                Some(pid),
+                suppress,
                 prior_front,
                 "scroll.CGScrollWheel",
                 || async move {
                     tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-                        let do_it = move || -> anyhow::Result<()> {
+                        let deliver = move || -> anyhow::Result<()> {
                             crate::input::mouse::scroll_wheel_at_xy(
                                 pid,
                                 screen_x,
@@ -543,18 +606,9 @@ impl Tool for ScrollTool {
                                 amount_ticks,
                             )
                         };
-                        // Foreground rung: brief front → wheel → restore prior frontmost.
-                        match (fg, wid) {
-                            (true, Some(w)) => {
-                                crate::input::skylight::with_foreground_assist(
-                                    pid as libc::pid_t,
-                                    w,
-                                    do_it,
-                                )?;
-                                Ok(())
-                            }
-                            _ => do_it(),
-                        }
+                        // Foreground rung: brief front → guarded wheel → restore
+                        // prior frontmost. Suppression allows this activation.
+                        run_wheel(dispatch, pid, wid, (screen_x, screen_y), deliver)
                     })
                     .await
                 },
@@ -753,5 +807,28 @@ mod tests {
         assert_eq!(clamp_amount(1100), AMOUNT_MAX as usize);
         assert_eq!(clamp_amount(0), AMOUNT_MIN as usize);
         assert_eq!(clamp_amount(3), 3);
+    }
+
+    /// Foreground wheel with a window installs the pointer guard and allows
+    /// the target's activation. Every other wheel posture keeps suppression.
+    #[test]
+    fn foreground_wheel_selects_pointer_guard_and_allows_activation() {
+        let foreground = wheel_dispatch(true, true);
+        assert!(foreground.allow_intended_activation());
+        assert_eq!(foreground.suppression_target(42), None);
+        assert!(wheel_uses_pointer_guard(foreground, true));
+
+        let missing_window = wheel_dispatch(true, false);
+        assert!(!missing_window.allow_intended_activation());
+        assert_eq!(missing_window.suppression_target(42), Some(42));
+        assert!(!wheel_uses_pointer_guard(missing_window, false));
+
+        let background = wheel_dispatch(false, true);
+        assert!(!background.allow_intended_activation());
+        assert_eq!(background.suppression_target(42), Some(42));
+        assert!(
+            !wheel_uses_pointer_guard(background, true),
+            "a window without foreground delivery stays suppressed"
+        );
     }
 }

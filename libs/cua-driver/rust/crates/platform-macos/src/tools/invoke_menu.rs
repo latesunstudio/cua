@@ -117,6 +117,21 @@ unsafe fn resolve_exact_prefix(
             }
         }
 
+        // AppKit keeps hidden alternates and disabled duplicates under the
+        // same title. The visible item is the first enabled candidate.
+        if matches.len() > 1 {
+            let (enabled, disabled): (Vec<_>, Vec<_>) = matches
+                .into_iter()
+                .partition(|item| copy_bool_attr(*item, "AXEnabled") != Some(false));
+            for item in &disabled {
+                CFRelease(*item as CFTypeRef);
+            }
+            matches = enabled;
+            while matches.len() > 1 {
+                let extra = matches.pop().expect("more than one match");
+                CFRelease(extra as CFTypeRef);
+            }
+        }
         if matches.len() != 1 {
             let match_count = matches.len();
             for candidate in matches {
@@ -475,6 +490,7 @@ impl Tool for InvokeMenuTool {
     }
 
     async fn invoke(&self, args: Value) -> ToolResult {
+        super::note_foreground_request("invoke_menu", &args);
         let input: InvokeMenuInput =
             match cua_driver_core::tool_args::parse_typed_input("invoke_menu", args) {
                 Ok(input) => input,

@@ -909,6 +909,19 @@ pub fn with_foreground_hid_activation(
     result
 }
 
+/// Pointer HID requires both exact keyboard activation and a fresh physical
+/// hit proof. Keyboard callers keep their existing exact-focus contract.
+pub(crate) fn with_foreground_pointer_activation(
+    pid: libc::pid_t,
+    wid: u32,
+    points: &[(f64, f64)],
+    action: impl FnOnce() -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    with_foreground_hid_activation(pid, wid, || {
+        super::pointer::with_target(pid, wid, points, action)
+    })
+}
+
 fn preserves_exact_existing_focus(
     previous_process_known: bool,
     previous_psn: [u8; 8],

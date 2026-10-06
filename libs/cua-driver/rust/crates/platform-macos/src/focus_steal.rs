@@ -74,6 +74,8 @@ const ENTRY_DEADLINE: Duration = Duration::from_secs(5);
 /// Janitor tick interval. The task wakes up this often while the
 /// dispatcher is non-empty and prunes expired entries.
 const JANITOR_TICK: Duration = Duration::from_secs(1);
+const LAUNCH_WATCHDOG: &str = "LaunchAppTool.watchdog";
+const WATCHDOG_DEADLINE: Duration = Duration::from_secs(8);
 
 /// Identifier for a suppression. `with_suppression` and `begin_suppression`
 /// hand one of these back; `end_suppression` consumes it.
@@ -100,6 +102,8 @@ struct Entry {
     /// Monotonic deadline. After this, the entry is pruned without
     /// firing.
     deadline: Instant,
+    /// Observer coverage remains 5s; the detached launch poll lasts 8s.
+    observer_deadline: Instant,
     /// Provenance for tracing — e.g. `"LaunchAppTool.pre"`.
     #[allow(dead_code)]
     origin: &'static str,
@@ -186,6 +190,28 @@ impl FocusStealPreventer {
         let _lease = Self::begin_suppression(target_pid, restore_to, origin);
         f().await
     }
+
+    /// Register before spawning the launch task, so a subsequent foreground
+    /// request cannot race a delayed task that re-arms suppression.
+    pub fn begin_launch_watchdog(target_pid: i32, restore_to: i32) -> SuppressionLease {
+        let shared = Self::shared();
+        let handle = shared
+            .dispatcher
+            .add(Some(target_pid), restore_to, LAUNCH_WATCHDOG);
+        SuppressionLease {
+            handle,
+            dispatcher: Arc::clone(&shared.dispatcher),
+            released: false,
+        }
+    }
+
+    /// Later explicit foreground intent supersedes background launch protection
+    /// for this app. Cancellation and restoration share the dispatcher lock:
+    /// a restore already in progress finishes before this returns, and no
+    /// observer notification or poll can restore from a cancelled lease.
+    pub fn note_foreground_request(pid: i32) {
+        Self::shared().dispatcher.cancel_launch_watchdogs(pid);
+    }
 }
 
 /// Begin-suppression convenience that bounces through the singleton.
@@ -215,6 +241,12 @@ pub struct SuppressionLease {
 }
 
 impl SuppressionLease {
+    /// Run a poll only while its lease remains live. Both the active-app read
+    /// and optional demotion occur under the cancellation lock.
+    pub fn while_active(&self, f: impl FnOnce()) -> bool {
+        self.dispatcher.with_entry(self.handle, f)
+    }
+
     /// Explicit release. Useful if the caller wants to drop the lease
     /// before its scope ends without taking the `Drop` path.
     pub fn release(mut self) {
@@ -296,7 +328,13 @@ impl Dispatcher {
             target_pid,
             allowed_pid,
             restore_to,
-            deadline: Instant::now() + ENTRY_DEADLINE,
+            deadline: Instant::now()
+                + if origin == LAUNCH_WATCHDOG {
+                    WATCHDOG_DEADLINE
+                } else {
+                    ENTRY_DEADLINE
+                },
+            observer_deadline: Instant::now() + ENTRY_DEADLINE,
             origin,
         };
         {
@@ -324,9 +362,45 @@ impl Dispatcher {
         }
     }
 
-    /// Snapshot the entries (cloned to a small Vec) — used by tests
-    /// and the activation handler to evaluate matches without holding
-    /// the lock across the restore call.
+    fn cancel_launch_watchdogs(&self, pid: i32) {
+        let mut entries = self.entries.lock().unwrap();
+        entries
+            .retain(|_, entry| !(entry.origin == LAUNCH_WATCHDOG && entry.target_pid == Some(pid)));
+    }
+
+    fn with_entry(&self, handle: SuppressionHandle, f: impl FnOnce()) -> bool {
+        let entries = self.entries.lock().unwrap();
+        if !entries
+            .get(&handle.0)
+            .is_some_and(|entry| entry.deadline > Instant::now())
+        {
+            return false;
+        }
+        f();
+        true
+    }
+
+    /// Execute restores under the same lock as cancellation. Copying restore
+    /// pids out of the lock let an already queued notification demote an app
+    /// after a later explicit request had cancelled its protection.
+    fn restore_matches(&self, activated_pid: i32, mut restore: impl FnMut(i32)) {
+        let mut entries = self.entries.lock().unwrap();
+        entries.retain(|_, entry| entry.deadline > Instant::now());
+        for entry in entries.values() {
+            if entry.observer_deadline > Instant::now()
+                && entry.allowed_pid != Some(activated_pid)
+                && match entry.target_pid {
+                    Some(pid) => pid == activated_pid,
+                    None => activated_pid != entry.restore_to,
+                }
+            {
+                restore(entry.restore_to);
+            }
+        }
+    }
+
+    /// Inspect matches for pure dispatcher tests without Cocoa activation.
+    #[cfg(test)]
     fn snapshot_matches(&self, activated_pid: i32) -> Vec<i32> {
         let mut guard = self.entries.lock().unwrap();
         // Reap expired entries first — keeps the dispatcher honest even
@@ -336,6 +410,9 @@ impl Dispatcher {
         guard
             .values()
             .filter(|e| {
+                if e.observer_deadline <= now {
+                    return false;
+                }
                 if e.allowed_pid == Some(activated_pid) {
                     return false;
                 }
@@ -515,10 +592,7 @@ fn handle_activation(dispatcher: &Arc<Dispatcher>, note: &objc2_foundation::NSNo
         pid as i32
     };
 
-    let restore_pids = dispatcher.snapshot_matches(activated_pid);
-    for pid in restore_pids {
-        restore_focus(pid);
-    }
+    dispatcher.restore_matches(activated_pid, restore_focus);
 }
 
 /// Re-activate `pid` if it's still running. Safe to call from any
@@ -541,6 +615,70 @@ fn restore_focus(pid: i32) {
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    #[test]
+    fn foreground_intent_cancels_observer_and_poll_for_only_its_app() {
+        let d = Arc::new(Dispatcher::new());
+        let first = d.add(Some(42), 7, LAUNCH_WATCHDOG);
+        let second = d.add(Some(99), 7, LAUNCH_WATCHDOG);
+        // The task has captured its lease but need not have started yet.
+        d.cancel_launch_watchdogs(42);
+        assert!(!d.with_entry(first, || panic!("cancelled poll must not run")));
+        d.restore_matches(42, |_| panic!("queued activation must not demote"));
+        let mut restored = Vec::new();
+        d.restore_matches(99, |pid| restored.push(pid));
+        assert_eq!(restored, [7]);
+        assert!(d.with_entry(second, || {}));
+    }
+
+    #[test]
+    fn foreground_intent_waits_for_inflight_restore_then_prevents_stale_polls() {
+        let d = Arc::new(Dispatcher::new());
+        let h = d.add(Some(42), 7, LAUNCH_WATCHDOG);
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let poll_d = d.clone();
+        let poll = std::thread::spawn(move || {
+            poll_d.with_entry(h, || {
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            })
+        });
+        entered_rx.recv().unwrap();
+        let cancel_d = d.clone();
+        let cancel = std::thread::spawn(move || cancel_d.cancel_launch_watchdogs(42));
+        release_tx.send(()).unwrap();
+        assert!(poll.join().unwrap());
+        cancel.join().unwrap();
+        // A later caller may activate now; neither old path can demote it.
+        assert!(!d.with_entry(h, || panic!("stale poll")));
+        d.restore_matches(42, |_| panic!("stale observer"));
+    }
+
+    #[test]
+    fn watchdog_keeps_original_five_second_observer_and_eight_second_poll() {
+        let d = Arc::new(Dispatcher::new());
+        let h = d.add(Some(42), 7, LAUNCH_WATCHDOG);
+        d.entries
+            .lock()
+            .unwrap()
+            .get_mut(&h.0)
+            .unwrap()
+            .observer_deadline = Instant::now() - Duration::from_secs(1);
+        d.restore_matches(42, |_| panic!("observer coverage expired"));
+        assert!(d.with_entry(h, || {}), "manual poll still covered");
+        d.cancel_launch_watchdogs(42);
+        assert!(!d.with_entry(h, || panic!("cancelled tail poll")));
+    }
+
+    #[test]
+    fn foreground_intent_preserves_other_background_suppression() {
+        let d = Arc::new(Dispatcher::new());
+        d.add(Some(42), 7, LAUNCH_WATCHDOG);
+        d.add(Some(42), 8, "background.operation");
+        d.cancel_launch_watchdogs(42);
+        assert_eq!(d.snapshot_matches(42), [8]);
+    }
 
     /// Dispatcher::add returns a handle, the entry is reachable by
     /// match, and remove() drops it.
@@ -638,6 +776,7 @@ mod tests {
                     allowed_pid: None,
                     restore_to: 7,
                     deadline: Instant::now() - Duration::from_secs(1),
+                    observer_deadline: Instant::now() - Duration::from_secs(1),
                     origin: "test.leak",
                 },
             );

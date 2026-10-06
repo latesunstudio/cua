@@ -51,6 +51,8 @@ pub const kAXValueIllegalType: AXValueType = 1_000;
 #[link(name = "ApplicationServices", kind = "framework")]
 extern "C" {
     pub fn AXUIElementCreateApplication(pid: i32) -> AXUIElementRef;
+    pub fn AXUIElementCreateSystemWide() -> AXUIElementRef;
+    pub fn AXUIElementGetPid(element: AXUIElementRef, pid: *mut i32) -> AXError;
     pub fn AXUIElementCopyAttributeValue(
         element: AXUIElementRef,
         attribute: CFStringRef,
