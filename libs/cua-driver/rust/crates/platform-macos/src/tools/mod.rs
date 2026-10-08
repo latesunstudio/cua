@@ -6,6 +6,7 @@ mod click;
 mod clipboard;
 mod double_click;
 mod drag;
+mod foreground_typing;
 mod get_window_state;
 mod hotkey;
 mod invoke_menu;

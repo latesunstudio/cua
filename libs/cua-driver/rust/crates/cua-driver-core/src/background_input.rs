@@ -292,8 +292,11 @@ pub fn decide_background_input(
                     format!(
                         "pid {} owns {} other eligible top-level window(s); process-scoped \
                          key events cannot be proven to reach window {} and could mutate a \
-                         sibling window. Use an exact element action, the page tool for \
-                         browser content, or delivery_mode:\"foreground\"",
+                         sibling window. For browser content, use a browser tool (such as the \
+                         page tool) that drives the page directly; for a native control, use \
+                         an exact element action (set_value, or type_text with element_token). \
+                         Foreground delivery is a last resort: only into an editable field \
+                         that a fresh look shows focused",
                         target.pid, facts.competing_keyboard_destinations, target.window_id
                     ),
                     Some("accessibility"),

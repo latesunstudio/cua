@@ -96,32 +96,70 @@ pub fn type_text(pid: i32, text: &str) -> anyhow::Result<()> {
 /// Type a string character-by-character with an extra `inter_char_delay_ms`
 /// pause after each character (on top of the internal down/up key gap).
 pub fn type_text_with_delay(pid: i32, text: &str, inter_char_delay_ms: u64) -> anyhow::Result<()> {
-    let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
-        .map_err(|_| anyhow::anyhow!("CGEventSource::new failed"))?;
+    type_text_with_delay_until(pid, text, inter_char_delay_ms, || false).map(|_| ())
+}
 
+/// [`type_text_with_delay`] that checks `stop` before every character and
+/// returns how many characters it posted.
+pub fn type_text_with_delay_until(
+    pid: i32,
+    text: &str,
+    inter_char_delay_ms: u64,
+    mut stop: impl FnMut() -> bool,
+) -> anyhow::Result<usize> {
+    let typer = PidTyper::new(pid, inter_char_delay_ms)?;
+    let mut posted = 0;
     for ch in text.chars() {
+        if stop() {
+            break;
+        }
+        typer.post(ch)?;
+        posted += 1;
+    }
+    Ok(posted)
+}
+
+/// Posts single characters to one pid, paced like [`type_text_with_delay`].
+pub struct PidTyper {
+    pid: i32,
+    inter_char_delay_ms: u64,
+    source: CGEventSource,
+}
+
+impl PidTyper {
+    pub fn new(pid: i32, inter_char_delay_ms: u64) -> anyhow::Result<Self> {
+        let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
+            .map_err(|_| anyhow::anyhow!("CGEventSource::new failed"))?;
+        Ok(Self {
+            pid,
+            inter_char_delay_ms,
+            source,
+        })
+    }
+
+    pub fn post(&self, ch: char) -> anyhow::Result<()> {
         let ch_str = ch.to_string();
-        let down = CGEvent::new_keyboard_event(source.clone(), 0, true)
+        let down = CGEvent::new_keyboard_event(self.source.clone(), 0, true)
             .map_err(|_| anyhow::anyhow!("CGEvent keyboard down failed"))?;
         down.set_string(&ch_str);
         down.set_flags(CGEventFlags::CGEventFlagNull);
-        post_keyboard_event(pid, &down);
+        post_keyboard_event(self.pid, &down);
         key_gap_sleep();
 
-        let up = CGEvent::new_keyboard_event(source.clone(), 0, false)
+        let up = CGEvent::new_keyboard_event(self.source.clone(), 0, false)
             .map_err(|_| anyhow::anyhow!("CGEvent keyboard up failed"))?;
         up.set_string(&ch_str);
         up.set_flags(CGEventFlags::CGEventFlagNull);
-        post_keyboard_event(pid, &up);
+        post_keyboard_event(self.pid, &up);
 
         // Additional inter-character delay on top of the internal key gap.
-        if inter_char_delay_ms > 0 {
-            std::thread::sleep(std::time::Duration::from_millis(inter_char_delay_ms));
+        if self.inter_char_delay_ms > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(self.inter_char_delay_ms));
         } else {
             key_gap_sleep();
         }
+        Ok(())
     }
-    Ok(())
 }
 
 /// Send a key combination (hotkey) to `pid`.
@@ -386,25 +424,47 @@ pub fn type_text_global_checked(
     inter_char_delay_ms: u64,
     expected_pid: Option<i32>,
 ) -> anyhow::Result<usize> {
-    use core_graphics::event::CGEventTapLocation;
-    let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
-        .map_err(|_| anyhow::anyhow!("CGEventSource::new failed"))?;
+    let typer = GlobalTyper::new(inter_char_delay_ms)?;
     deliver_text_checked(text, expected_pid, crate::apps::frontmost_pid, |ch| {
+        typer.post(ch)
+    })
+}
+
+/// Posts single characters to the frontmost app through the global HID queue.
+pub struct GlobalTyper {
+    inter_char_delay_ms: u64,
+    source: CGEventSource,
+}
+
+impl GlobalTyper {
+    pub fn new(inter_char_delay_ms: u64) -> anyhow::Result<Self> {
+        let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
+            .map_err(|_| anyhow::anyhow!("CGEventSource::new failed"))?;
+        Ok(Self {
+            inter_char_delay_ms,
+            source,
+        })
+    }
+
+    pub fn post(&self, ch: char) -> anyhow::Result<()> {
+        use core_graphics::event::CGEventTapLocation;
         let value = ch.to_string();
-        let down = CGEvent::new_keyboard_event(source.clone(), 0, true)
+        let down = CGEvent::new_keyboard_event(self.source.clone(), 0, true)
             .map_err(|_| anyhow::anyhow!("CGEvent keyboard down failed"))?;
         down.set_string(&value);
         down.set_flags(CGEventFlags::CGEventFlagNull);
         down.post(CGEventTapLocation::HID);
         key_gap_sleep();
-        let up = CGEvent::new_keyboard_event(source.clone(), 0, false)
+        let up = CGEvent::new_keyboard_event(self.source.clone(), 0, false)
             .map_err(|_| anyhow::anyhow!("CGEvent keyboard up failed"))?;
         up.set_string(&value);
         up.set_flags(CGEventFlags::CGEventFlagNull);
         up.post(CGEventTapLocation::HID);
-        std::thread::sleep(std::time::Duration::from_millis(inter_char_delay_ms).max(key_gap()));
+        std::thread::sleep(
+            std::time::Duration::from_millis(self.inter_char_delay_ms).max(key_gap()),
+        );
         Ok(())
-    })
+    }
 }
 
 fn deliver_text_checked(
@@ -431,13 +491,18 @@ mod deliver_text_tests {
     #[test]
     fn stops_before_the_character_that_would_land_in_another_app() {
         let mut seen = Vec::new();
-        let delivered = deliver_text_checked("abcd", Some(7), || Some(7), |ch| {
-            seen.push(ch);
-            if seen.len() == 2 {
-                // The next check observes the new frontmost app.
-            }
-            Ok(())
-        })
+        let delivered = deliver_text_checked(
+            "abcd",
+            Some(7),
+            || Some(7),
+            |ch| {
+                seen.push(ch);
+                if seen.len() == 2 {
+                    // The next check observes the new frontmost app.
+                }
+                Ok(())
+            },
+        )
         .unwrap();
         assert_eq!(delivered, 4);
         let front = std::cell::Cell::new(Some(7i32));

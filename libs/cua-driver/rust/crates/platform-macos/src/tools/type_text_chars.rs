@@ -116,13 +116,20 @@ impl Tool for TypeTextCharsTool {
         drop(element_guard);
 
         let text_len = text.chars().count();
+        // A dropped call (its client went away) stops before the next character.
+        let (_cancel_on_drop, cancel) = super::foreground_typing::Cancellation::for_call(&args);
         let result = tokio::task::spawn_blocking(move || {
-            crate::input::keyboard::type_text_with_delay(pid, &text, delay_ms)
+            crate::input::keyboard::type_text_with_delay_until(pid, &text, delay_ms, || {
+                cancel.is_cancelled()
+            })
         })
         .await;
 
         match result {
-            Ok(Ok(())) => ToolResult::text(format!(
+            Ok(Ok(posted)) if posted < text_len => ToolResult::error(format!(
+                "Typing cancelled after {posted} of {text_len} character(s)."
+            )),
+            Ok(Ok(_)) => ToolResult::text(format!(
                 "Typed {text_len} character(s) with {delay_ms}ms delay."
             )),
             Ok(Err(e)) => ToolResult::error(format!("Type text chars failed: {e}")),

@@ -33,13 +33,15 @@ use std::sync::Arc;
 
 use crate::apps;
 use crate::ax::bindings::{
-    copy_string_attr, focused_element_of_pid, kAXErrorSuccess, set_string_attr, AXUIElementRef,
+    copy_string_attr, focused_element_of_pid, is_attribute_settable, kAXErrorSuccess,
+    set_string_attr, AXUIElementRef,
 };
 use crate::focus_guard;
 use crate::window_change_detector::WindowChangeDetector;
 use core_foundation::base::CFRelease;
 use cua_driver_core::background_input::BackgroundRefusal;
 
+use super::foreground_typing::{self, Cancellation, ForegroundRoute, KeystrokeReport};
 use super::ToolState;
 
 pub struct TypeTextTool {
@@ -115,7 +117,7 @@ fn def() -> &'static ToolDef {
                 "delivery_mode": {
                     "type": "string",
                     "enum": ["background", "foreground"],
-                    "description": "Best-effort-background ladder rung (default \"background\"). \"background\": AX insert, then CGEvent keystrokes if needed — no focus steal; native controls can be confirmed via AXValue read-back, while web-content writes remain effect:\"unverifiable\". \"foreground\": briefly front the window, type, restore the prior frontmost — the explicit last resort for focus-sensitive surfaces (e.g. WhatsApp/Catalyst) where background keystrokes don't land. Re-call with \"foreground\" when a background attempt remains unverifiable and a fresh snapshot shows the text did not appear."
+                    "description": "Best-effort-background ladder rung (default \"background\"). \"background\": AX insert, then CGEvent keystrokes if needed — no focus steal; native controls can be confirmed via AXValue read-back, while web-content writes remain effect:\"unverifiable\". \"foreground\": briefly front the window, type, restore the prior frontmost — the explicit last resort for focus-sensitive surfaces (e.g. WhatsApp/Catalyst) where background keystrokes don't land. It types only into a focused editable field (the element_token's, when given) and refuses otherwise, stops after a few keystrokes the field doesn't take, writes long text to a native field in one accessibility call when that can be confirmed, and pauses when fields keep rejecting keystrokes. Re-call with \"foreground\" when a background attempt remains unverifiable and a fresh snapshot shows the text did not appear."
                 }
             },
             "additionalProperties": false
@@ -162,6 +164,9 @@ impl Tool for TypeTextTool {
     async fn invoke(&self, args: Value) -> ToolResult {
         super::note_foreground_request("type_text", &args);
         use cua_driver_core::tool_args::ArgsExt;
+        // Held until this call returns: a dropped call (its client went away)
+        // stops typing before the next keystroke.
+        let (_cancel_on_drop, cancel) = Cancellation::for_call(&args);
         if args.opt_str("scope").as_deref() == Some("desktop")
             && args.get("pid").is_none()
             && args.get("window_id").is_none()
@@ -193,6 +198,29 @@ impl Tool for TypeTextTool {
                 },
             };
             let total_chars = text.chars().count();
+            let target_pid = expected_pid.or_else(apps::frontmost_pid);
+            if !target_pid.is_some_and(foreground_typing::is_input_forwarder) {
+                let result = tokio::task::spawn_blocking(move || {
+                    type_text_desktop_guarded(&text, delay_ms, target_pid, &cancel)
+                })
+                .await;
+                return match result {
+                    Ok(Ok(mut result)) => {
+                        if let Some(structured) = result.structured_content.as_mut() {
+                            structured["scope"] = serde_json::json!("desktop");
+                            structured["route"] = serde_json::json!("global_input");
+                            structured["expected_pid"] = serde_json::json!(expected_pid);
+                        }
+                        result
+                    }
+                    Ok(Err(error)) => {
+                        ToolResult::error(format!("desktop type_text failed: {error}"))
+                    }
+                    Err(error) => {
+                        ToolResult::error(format!("desktop type_text task failed: {error}"))
+                    }
+                };
+            }
             let result = tokio::task::spawn_blocking(move || {
                 crate::input::keyboard::type_text_global_checked(&text, delay_ms, expected_pid)
             })
@@ -200,18 +228,20 @@ impl Tool for TypeTextTool {
             return match result {
                 Ok(Ok(delivered)) if delivered < total_chars => {
                     ToolResult::error(format!(
-                        "Desktop typing stopped because focus moved: delivered {delivered} of {total_chars} character(s). Refocus the intended app and retry only the remaining suffix."
+                        "Desktop typing stopped because focus moved: posted {delivered} of {total_chars} character(s) before another app came to the front. Refocus the intended app and take a fresh look before typing again."
                     ))
                     .with_structured(serde_json::json!({
                         "scope": "desktop",
                         "route": "global_input",
                         "path": "hid",
-                        "effect": if delivered == 0 { "refused" } else { "partial" },
+                        "effect": if delivered == 0 { "refused" } else { "unverifiable" },
                         "code": "foreground_focus_changed",
                         "expected_pid": expected_pid,
-                        "delivered_chars": delivered,
-                        "total_chars": total_chars,
-                        "escalation": { "recommended": "bring_to_front", "retry": "remaining_suffix_only" }
+                        "posted_keystrokes": delivered,
+                        "verified_chars": null,
+                        "requested_chars": total_chars,
+                        "retryable": false,
+                        "escalation": { "recommended": "bring_to_front" }
                     }))
                 }
                 Ok(Ok(delivered)) => {
@@ -220,8 +250,9 @@ impl Tool for TypeTextTool {
                             "scope": "desktop",
                             "path": "hid",
                             "effect": "unverifiable",
-                            "delivered_chars": delivered,
-                            "total_chars": total_chars
+                            "posted_keystrokes": delivered,
+                            "verified_chars": null,
+                            "requested_chars": total_chars
                         }))
                 }
                 Ok(Err(error)) => ToolResult::error(format!("desktop type_text failed: {error}")),
@@ -422,6 +453,7 @@ impl Tool for TypeTextTool {
                             delivery_mode,
                             window_id,
                             keyboard_policy: blocking_policy,
+                            cancel,
                         },
                     )
                 })
@@ -444,6 +476,24 @@ impl Tool for TypeTextTool {
                 refusal,
                 ax_attempt,
             })) => return synthesis_refusal_result(path, &refusal, ax_attempt),
+            Ok(Ok(TypeTextDelivery::Reported(result))) => return result,
+            Ok(Ok(TypeTextDelivery::Keystrokes {
+                path,
+                report,
+                verified,
+                detail,
+            })) => {
+                let web_content =
+                    verified.is_some() && target_in_web_area(pid, element_ptr, window_id);
+                return foreground_typing::keystroke_result(
+                    path,
+                    char_count,
+                    report,
+                    verified,
+                    &detail,
+                    web_content,
+                );
+            }
             Ok(Ok(TypeTextDelivery::Typed(outcome))) => Ok(Ok(outcome)),
             Ok(Err(error)) => Ok(Err(error)),
             Err(error) => Err(error),
@@ -451,20 +501,7 @@ impl Tool for TypeTextTool {
 
         match result {
             Ok(Ok(outcome)) if outcome.delivered_chars.is_some_and(|n| n < char_count) => {
-                let delivered_chars = outcome.delivered_chars.unwrap_or_default();
-                ToolResult::error(format!(
-                    "type_text incomplete: delivered {delivered_chars} of {char_count} character(s){}; retry only the remaining suffix",
-                    outcome.detail
-                ))
-                .with_structured(serde_json::json!({
-                    "code": "type_text_incomplete",
-                    "path": outcome.path,
-                    "effect": "partial",
-                    "requested_chars": char_count,
-                    "delivered_chars": delivered_chars,
-                    "retryable": true,
-                    "retry_from_character": delivered_chars,
-                }))
+                incomplete_result(&outcome, char_count)
             }
             Ok(Ok(outcome)) => {
                 let TypeTextOutcome {
@@ -608,6 +645,8 @@ impl Tool for TypeTextTool {
 const PATH_AX: &str = "ax";
 const PATH_KEY_EVENTS: &str = "key_events";
 const PATH_KEY_EVENTS_FG: &str = "key_events_fg";
+/// Long foreground text written into the verified field in one AX call.
+const PATH_AX_FG: &str = "ax_fg";
 
 // The daemon transport has a 120-second request deadline. Character synthesis
 // is synchronous and costs at least one 8ms key-down gap plus either the
@@ -754,7 +793,7 @@ fn synthesis_refusal_result(
 }
 
 fn path_has_untrusted_web_readback(path: &str) -> bool {
-    path == PATH_AX || path == PATH_KEY_EVENTS || path == PATH_KEY_EVENTS_FG
+    path == PATH_AX || path == PATH_KEY_EVENTS || path == PATH_KEY_EVENTS_FG || path == PATH_AX_FG
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -832,6 +871,15 @@ enum BackgroundKeyboardPolicy {
 /// posted (`Refused`) and the caller must return the structured refusal.
 enum TypeTextDelivery {
     Typed(TypeTextOutcome),
+    /// Guarded foreground keystrokes: posted and verified counts.
+    Keystrokes {
+        path: &'static str,
+        report: KeystrokeReport,
+        verified: Option<usize>,
+        detail: String,
+    },
+    /// A finished result, such as a focused-field or rate-guard refusal.
+    Reported(ToolResult),
     Refused(BackgroundRefusal),
     SynthesisRefused {
         path: &'static str,
@@ -1113,6 +1161,7 @@ fn cgevent_type_verified(
     element_ptr_and_idx: Option<(usize, Option<usize>)>,
     settle_ms: u64,
     window_id: Option<u32>,
+    cancel: &Cancellation,
 ) -> anyhow::Result<(bool, Option<usize>)> {
     // Focus the target element so the keystrokes land in IT. Critical in
     // foreground mode: a freshly-fronted window's keyboard focus may be on the
@@ -1140,7 +1189,9 @@ fn cgevent_type_verified(
     if settle_ms > 0 {
         std::thread::sleep(std::time::Duration::from_millis(settle_ms));
     }
-    crate::input::keyboard::type_text_with_delay(pid, text, delay_ms)?;
+    crate::input::keyboard::type_text_with_delay_until(pid, text, delay_ms, || {
+        cancel.is_cancelled()
+    })?;
 
     // CGEvent posting is asynchronous with respect to the renderer. In
     // particular, Chromium can acknowledge the posting process while a long
@@ -1182,12 +1233,429 @@ fn await_typed_delivery(
     }
 }
 
+/// An observed incomplete delivery. A retry is suggested only for the suffix
+/// after characters that were verified in the field; when none were, the
+/// caller must look before typing again.
+fn incomplete_result(outcome: &TypeTextOutcome, requested: usize) -> ToolResult {
+    let delivered = outcome.delivered_chars.unwrap_or_default();
+    if delivered == 0 {
+        return ToolResult::error(format!(
+            "type_text did not land: none of the {requested} character(s) appear in the field{}. Take a fresh look before typing again.",
+            outcome.detail
+        ))
+        .with_structured(serde_json::json!({
+            "code": "type_text_not_delivered",
+            "path": outcome.path,
+            "effect": "refused",
+            "requested_chars": requested,
+            "verified_chars": 0,
+            "retryable": false,
+            "escalation": {
+                "recommended": "verify_state",
+                "reason": "Nothing was verified in the field; re-read it before deciding what to send.",
+            },
+        }));
+    }
+    ToolResult::error(format!(
+        "type_text incomplete: {delivered} of {requested} character(s) are in the field{}; retry only the remaining suffix",
+        outcome.detail
+    ))
+    .with_structured(serde_json::json!({
+        "code": "type_text_incomplete",
+        "path": outcome.path,
+        "effect": "partial",
+        "requested_chars": requested,
+        "verified_chars": delivered,
+        "retryable": true,
+        "retry_from_character": delivered,
+    }))
+}
+
+/// Guarded keystrokes to one pid, checked against the field that takes them.
+struct PidKeystrokes {
+    typer: crate::input::keyboard::PidTyper,
+    pid: i32,
+    field: AXUIElementRef,
+    readable: bool,
+}
+
+impl foreground_typing::KeystrokeTarget for PidKeystrokes {
+    fn post(&mut self, ch: char) -> anyhow::Result<()> {
+        self.typer.post(ch)
+    }
+    fn value(&mut self) -> Option<String> {
+        self.readable
+            .then(|| unsafe { copy_string_attr(self.field, "AXValue") })
+            .flatten()
+    }
+    fn focused(&mut self) -> bool {
+        crate::input::ax_actions::is_element_focused(self.pid, self.field as usize)
+    }
+    fn now(&self) -> std::time::Instant {
+        std::time::Instant::now()
+    }
+    fn sleep(&mut self, duration: std::time::Duration) {
+        std::thread::sleep(duration)
+    }
+}
+
+/// Guarded keystrokes through the global HID queue to the frontmost app.
+struct GlobalKeystrokes {
+    typer: crate::input::keyboard::GlobalTyper,
+    pid: i32,
+    field: AXUIElementRef,
+    readable: bool,
+}
+
+impl foreground_typing::KeystrokeTarget for GlobalKeystrokes {
+    fn post(&mut self, ch: char) -> anyhow::Result<()> {
+        self.typer.post(ch)
+    }
+    fn value(&mut self) -> Option<String> {
+        self.readable
+            .then(|| unsafe { copy_string_attr(self.field, "AXValue") })
+            .flatten()
+    }
+    fn focused(&mut self) -> bool {
+        apps::frontmost_pid() == Some(self.pid)
+            && crate::input::ax_actions::is_element_focused(self.pid, self.field as usize)
+    }
+    fn now(&self) -> std::time::Instant {
+        std::time::Instant::now()
+    }
+    fn sleep(&mut self, duration: std::time::Duration) {
+        std::thread::sleep(duration)
+    }
+}
+
+/// How long a stopped keystroke run waits for the field to show what landed.
+const STOPPED_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(300);
+
+/// Final read-back after guarded keystrokes: characters verified in the field.
+fn verify_keystrokes(
+    report: KeystrokeReport,
+    before: Option<&str>,
+    text: &str,
+    read_value: impl FnMut() -> Option<String>,
+) -> Option<usize> {
+    let wait = if report.stop == foreground_typing::KeystrokeStop::Completed {
+        DELIVERY_DRAIN_TIMEOUT
+    } else {
+        STOPPED_DRAIN_TIMEOUT
+    };
+    let posted: String = text.chars().take(report.posted).collect();
+    let (_, verified) = await_typed_delivery(
+        before,
+        &posted,
+        std::time::Instant::now() + wait,
+        read_value,
+    );
+    verified
+}
+
+/// Long foreground text: one accessibility write into the verified field,
+/// then read back. Inserts at the cursor (replacing any selection) through
+/// `AXSelectedText`; when that doesn't land and the field is empty or wholly
+/// selected, sets its whole `AXValue`, which is the same edit. Returns whether
+/// the whole text landed and how many characters were verified.
+///
+/// # Safety
+/// `field` must be a live `AXUIElementRef`.
+unsafe fn atomic_insert(
+    field: AXUIElementRef,
+    text: &str,
+    before: Option<&str>,
+) -> (bool, Option<usize>) {
+    let read = || unsafe { copy_string_attr(field, "AXValue") };
+    let selected = copy_string_attr(field, "AXSelectedText");
+    if set_string_attr(field, "AXSelectedText", text) == kAXErrorSuccess {
+        let delivery = await_typed_delivery(
+            before,
+            text,
+            std::time::Instant::now() + DELIVERY_DRAIN_TIMEOUT,
+            read,
+        );
+        if delivery.0 || delivery.1 != Some(0) {
+            return delivery;
+        }
+    }
+    let replaces_whole_value =
+        before == Some("") || (before.is_some() && selected.as_deref() == before);
+    if replaces_whole_value
+        && is_attribute_settable(field, "AXValue")
+        && set_string_attr(field, "AXValue", text) == kAXErrorSuccess
+    {
+        return await_typed_delivery(
+            Some(""),
+            text,
+            std::time::Instant::now() + DELIVERY_DRAIN_TIMEOUT,
+            read,
+        );
+    }
+    (false, before.map(|_| 0))
+}
+
+/// The guarded foreground rung for a pid (and window, when given).
+///
+/// Fronts the window, focuses the requested element, and checks that the
+/// element holding keyboard focus is an editable field before any keystroke.
+/// Short text is typed with [`foreground_typing::post_guarded`]; text longer
+/// than the keystroke cap goes through [`atomic_insert`] instead.
+fn type_text_foreground_guarded(
+    pid: i32,
+    text: &str,
+    element_ptr_and_idx: Option<(usize, Option<usize>)>,
+    delay_ms: u64,
+    key_driven: bool,
+    window_id: Option<u32>,
+    cancel: &Cancellation,
+) -> anyhow::Result<TypeTextDelivery> {
+    let requested = text.chars().count();
+    let guard = foreground_typing::rate_guard();
+    let path = if window_id.is_some() {
+        PATH_KEY_EVENTS_FG
+    } else {
+        PATH_KEY_EVENTS
+    };
+    if !guard.open(std::time::Instant::now()) {
+        return Ok(TypeTextDelivery::Reported(
+            foreground_typing::rate_limited_result(path, requested),
+        ));
+    }
+    let settle_ms = foreground_settle_ms(pid, apps::frontmost_pid());
+    let mut delivery = None;
+    let mut body = || -> anyhow::Result<()> {
+        // Focus the requested element after activation so it lands after the
+        // window's remembered first responder, re-applying once if it didn't
+        // stick (see cgevent_type_verified).
+        if let Some((ptr, _)) = element_ptr_and_idx {
+            let _ = crate::input::ax_actions::focus_element(ptr);
+            if !crate::input::ax_actions::is_element_focused(pid, ptr) {
+                std::thread::sleep(FOCUS_REAPPLY_DELAY);
+                let _ = crate::input::ax_actions::focus_element(ptr);
+            }
+        }
+        // First-keystroke settle — see the "i love u" -> "love u" note.
+        std::thread::sleep(std::time::Duration::from_millis(settle_ms));
+
+        let (field, owned, is_requested) = match element_ptr_and_idx {
+            Some((ptr, _)) => (
+                ptr as AXUIElementRef,
+                false,
+                Some(crate::input::ax_actions::is_element_focused(pid, ptr)),
+            ),
+            None => {
+                let focused = match window_id {
+                    Some(wid) => unsafe {
+                        crate::ax::exact_target::focused_element_in_window(pid, wid)
+                    },
+                    None => unsafe { focused_element_of_pid(pid) },
+                };
+                (focused.unwrap_or(std::ptr::null_mut()), true, None)
+            }
+        };
+        let facts = unsafe { foreground_typing::read_field_facts(field, is_requested, key_driven) };
+        delivery = Some(match foreground_typing::classify_field(&facts) {
+            Err(refusal) => TypeTextDelivery::Reported(foreground_typing::field_refusal_result(
+                path, requested, &refusal,
+            )),
+            Ok(()) => 'typed: {
+                let readable = facts.value_readable();
+                let before = readable
+                    .then(|| unsafe { copy_string_attr(field, "AXValue") })
+                    .flatten();
+                let mut ax_attempt = AxAttempt::NotAttempted;
+                // A web page can echo an AX write in AXValue without seeing it,
+                // so its fields get real keystrokes.
+                let ax_confirmable =
+                    readable && !target_in_web_area(pid, Some((field as usize, None)), window_id);
+                if foreground_typing::foreground_route(requested, ax_confirmable)
+                    == ForegroundRoute::AtomicAxFirst
+                {
+                    match unsafe { atomic_insert(field, text, before.as_deref()) } {
+                        (true, verified) => {
+                            break 'typed TypeTextDelivery::Typed(TypeTextOutcome {
+                                detail: " via one accessibility write".into(),
+                                path: PATH_AX_FG,
+                                verified: true,
+                                delivered_chars: verified,
+                            })
+                        }
+                        // Verifiably nothing landed: type it instead.
+                        (false, Some(0)) => ax_attempt = AxAttempt::Unchanged,
+                        (false, verified) => {
+                            break 'typed TypeTextDelivery::Reported(
+                                foreground_typing::atomic_indeterminate_result(
+                                    PATH_AX_FG, requested, verified,
+                                ),
+                            )
+                        }
+                    }
+                }
+                if let Some(refusal) =
+                    synthesis_preflight(TextDeliveryRoute::UnicodeSynthesis, requested, delay_ms)
+                {
+                    break 'typed TypeTextDelivery::SynthesisRefused {
+                        path,
+                        refusal,
+                        ax_attempt,
+                    };
+                }
+                let mut target = PidKeystrokes {
+                    typer: crate::input::keyboard::PidTyper::new(pid, delay_ms)?,
+                    pid,
+                    field,
+                    readable,
+                };
+                let report = foreground_typing::post_guarded(
+                    text,
+                    before.as_deref(),
+                    &mut target,
+                    cancel,
+                    guard,
+                )?;
+                let verified = readable
+                    .then(|| {
+                        verify_keystrokes(report, before.as_deref(), text, || unsafe {
+                            copy_string_attr(field, "AXValue")
+                        })
+                    })
+                    .flatten();
+                TypeTextDelivery::Keystrokes {
+                    path,
+                    report,
+                    verified,
+                    detail: format!(" via foreground keystrokes ({delay_ms}ms delay)"),
+                }
+            }
+        });
+        if owned && !field.is_null() {
+            unsafe { CFRelease(field as _) };
+        }
+        Ok(())
+    };
+    let fronted = match window_id {
+        Some(wid) => crate::input::skylight::with_foreground_assist(pid as libc::pid_t, wid, body)?,
+        None => {
+            body()?;
+            false
+        }
+    };
+    let delivery = delivery.expect("the foreground body always decides a delivery");
+    // Only claim the `_fg` path when a front actually happened.
+    Ok(match delivery {
+        TypeTextDelivery::Keystrokes {
+            report,
+            verified,
+            detail,
+            ..
+        } if !fronted => TypeTextDelivery::Keystrokes {
+            path: PATH_KEY_EVENTS,
+            report,
+            verified,
+            detail,
+        },
+        other => other,
+    })
+}
+
+/// Guarded desktop-scope typing into the frontmost app's focused field.
+fn type_text_desktop_guarded(
+    text: &str,
+    delay_ms: u64,
+    pid: Option<i32>,
+    cancel: &Cancellation,
+) -> anyhow::Result<ToolResult> {
+    const PATH_HID: &str = "hid";
+    let requested = text.chars().count();
+    let guard = foreground_typing::rate_guard();
+    if !guard.open(std::time::Instant::now()) {
+        return Ok(foreground_typing::rate_limited_result(PATH_HID, requested));
+    }
+    let key_driven = pid.is_some_and(crate::terminal::is_terminal_pid);
+    let field = pid
+        .and_then(|pid| unsafe { focused_element_of_pid(pid) })
+        .unwrap_or(std::ptr::null_mut());
+    let facts = unsafe { foreground_typing::read_field_facts(field, None, key_driven) };
+    let result = match (pid, foreground_typing::classify_field(&facts)) {
+        (_, Err(refusal)) => foreground_typing::field_refusal_result(PATH_HID, requested, &refusal),
+        (None, Ok(())) => unreachable!("a focused field implies a pid"),
+        (Some(pid), Ok(())) => 'typed: {
+            let readable = facts.value_readable();
+            let before = readable
+                .then(|| unsafe { copy_string_attr(field, "AXValue") })
+                .flatten();
+            // A web page can echo an AX write in AXValue without seeing it,
+            // so its fields get real keystrokes.
+            let ax_confirmable =
+                readable && !target_in_web_area(pid, Some((field as usize, None)), None);
+            if foreground_typing::foreground_route(requested, ax_confirmable)
+                == ForegroundRoute::AtomicAxFirst
+            {
+                match unsafe { atomic_insert(field, text, before.as_deref()) } {
+                    (true, _) => break 'typed ToolResult::text(format!(
+                        "✅ Inserted {requested} char(s) into the frontmost app via one accessibility write."
+                    ))
+                    .with_structured(serde_json::json!({
+                        "path": PATH_AX_FG,
+                        "requested_chars": requested,
+                        "posted_keystrokes": 0,
+                        "verified_chars": requested,
+                        "verified": true,
+                        "effect": "confirmed",
+                    })),
+                    // Verifiably nothing landed: type it instead.
+                    (false, Some(0)) => {}
+                    (false, verified) => {
+                        break 'typed foreground_typing::atomic_indeterminate_result(
+                            PATH_AX_FG, requested, verified,
+                        )
+                    }
+                }
+            }
+            let mut target = GlobalKeystrokes {
+                typer: crate::input::keyboard::GlobalTyper::new(delay_ms)?,
+                pid,
+                field,
+                readable,
+            };
+            let report = foreground_typing::post_guarded(
+                text,
+                before.as_deref(),
+                &mut target,
+                cancel,
+                guard,
+            )?;
+            let verified = readable
+                .then(|| {
+                    verify_keystrokes(report, before.as_deref(), text, || unsafe {
+                        copy_string_attr(field, "AXValue")
+                    })
+                })
+                .flatten();
+            foreground_typing::keystroke_result(
+                PATH_HID,
+                requested,
+                report,
+                verified,
+                " into the frontmost app",
+                false,
+            )
+        }
+    };
+    if !field.is_null() {
+        unsafe { CFRelease(field as _) };
+    }
+    Ok(result)
+}
+
 /// How `type_text_blocking` may deliver: the requested mode, the addressed
 /// window, and the background keyboard policy decided for it.
 struct KeyboardRoute {
     delivery_mode: super::DeliveryMode,
     window_id: Option<u32>,
     keyboard_policy: BackgroundKeyboardPolicy,
+    cancel: Cancellation,
 }
 
 /// Best-effort-background ladder for `type_text`.
@@ -1212,6 +1680,7 @@ fn type_text_blocking(
         delivery_mode,
         window_id,
         keyboard_policy,
+        cancel,
     } = route;
     // Original field value before any rung drives read-back verification only.
     // An unreadable value is not evidence that the field is empty — and for a
@@ -1240,6 +1709,19 @@ fn type_text_blocking(
     let before = read_axvalue_bound(pid, element_ptr_and_idx, window_id);
 
     // --- Foreground rung: explicit agent request (skip AX/background ladder). ---
+    if delivery_mode.is_foreground() && !foreground_typing::is_input_forwarder(pid) {
+        return type_text_foreground_guarded(
+            pid,
+            text,
+            element_ptr_and_idx,
+            delay_ms,
+            is_terminal_target,
+            window_id,
+            &cancel,
+        );
+    }
+    // Remote desktops and VMs forward keys to another machine: no local field
+    // to check or read back, so they keep the unguarded foreground route.
     if delivery_mode.is_foreground() {
         let screen_sharing_target = crate::input::keyboard::is_screen_sharing_pid(pid);
         if let Some(refusal) = synthesis_preflight(
@@ -1279,6 +1761,7 @@ fn type_text_blocking(
                 element_ptr_and_idx,
                 foreground_settle_ms,
                 window_id,
+                &cancel,
             )
         };
         let ((verified, delivered_chars), fronted) = match window_id {
@@ -1353,6 +1836,7 @@ fn type_text_blocking(
             element_ptr_and_idx,
             /*settle_ms=*/ 0,
             window_id,
+            &cancel,
         )?;
         return Ok(TypeTextDelivery::Typed(TypeTextOutcome {
             detail: format!(" via CGEvent (terminal emulator, {delay_ms}ms delay)"),
@@ -1465,6 +1949,7 @@ fn type_text_blocking(
         element_ptr_and_idx,
         /*settle_ms=*/ 0,
         window_id,
+        &cancel,
     )?;
     Ok(TypeTextDelivery::Typed(TypeTextOutcome {
         detail: format!(" via CGEvent ({delay_ms}ms delay)"),
@@ -1498,6 +1983,7 @@ mod tests {
                 delivery_mode: super::super::DeliveryMode::Background,
                 window_id: Some(7),
                 keyboard_policy: BackgroundKeyboardPolicy::SemanticOnly(refusal.clone()),
+                cancel: Cancellation::default(),
             },
         );
         match r {
@@ -1519,6 +2005,7 @@ mod tests {
                 delivery_mode: super::super::DeliveryMode::Background,
                 window_id: None,
                 keyboard_policy: BackgroundKeyboardPolicy::Allowed,
+                cancel: Cancellation::default(),
             },
         )
         .expect("preflight refusal must not attempt the invalid pid");
