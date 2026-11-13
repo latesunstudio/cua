@@ -116,6 +116,23 @@ fn listable_layer(layer: i32, is_on_screen: bool, bounds: &WindowBounds) -> bool
             && bounds.height >= 1.0)
 }
 
+/// The `(pid, window_id)` rows that can take a process-scoped keystroke: the
+/// same windows `list_windows` admits, so an alert or modal panel an agent can
+/// find also counts as a sibling that could receive a key meant for another.
+pub(crate) fn keyboard_destination_rows(
+    windows: &[WindowInfo],
+) -> impl Iterator<Item = (i32, u32)> + '_ {
+    windows
+        .iter()
+        .filter(|w| listable_layer(w.layer, w.is_on_screen, &w.bounds))
+        .map(|w| (w.pid, w.window_id))
+}
+
+/// [`keyboard_destination_rows`] from a fresh WindowServer enumeration.
+pub(crate) fn live_keyboard_destination_rows() -> Vec<(i32, u32)> {
+    keyboard_destination_rows(&all_windows_any_layer()).collect()
+}
+
 /// Enumerate windows on every CGWindow layer, including the accessory layers
 /// (`layer != 0`) that [`all_windows`] hides.
 ///

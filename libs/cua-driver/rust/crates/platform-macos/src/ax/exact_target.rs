@@ -17,7 +17,7 @@ use super::bindings::{
     copy_string_attr, focused_element_of_pid, AXUIElementCreateApplication, AXUIElementRef,
 };
 use super::snapshot::RetainedElement;
-use crate::windows::{all_windows, resolve_window_owner, WindowOwner};
+use crate::windows::{live_keyboard_destination_rows, resolve_window_owner, WindowOwner};
 
 /// Bounded `AXParent` ascent used when an element does not expose `AXWindow`.
 const MAX_ANCESTRY_DEPTH: usize = 40;
@@ -178,6 +178,10 @@ unsafe fn ax_window_records(app: AXUIElementRef, pid: i32, window_id: u32) -> Ve
 
 /// Count independently AX-mapped, non-minimized sibling top-level windows.
 ///
+/// `window_server_rows` are layer-0 windows plus on-screen floating, modal,
+/// and alert windows (`crate::windows::keyboard_destination_rows`): two alerts
+/// of one process are as ambiguous a keyboard target as two document windows.
+///
 /// WindowServer may expose several layer-0 compositor surfaces for one native
 /// Electron, Tauri, or WebKit window. A raw same-pid CGWindow row is therefore
 /// not enough to prove another process-scoped keyboard destination. Requiring a
@@ -251,9 +255,7 @@ pub fn gather_background_facts(
     let competing_keyboard_destinations = count_competing_keyboard_destinations(
         pid,
         window_id,
-        all_windows()
-            .iter()
-            .map(|window| (window.pid, window.window_id)),
+        live_keyboard_destination_rows(),
         &records,
     );
 
@@ -356,6 +358,51 @@ mod tests {
         assert_eq!(
             count_competing_keyboard_destinations(42, 10, rows, &records),
             1
+        );
+    }
+
+    fn cg_window(window_id: u32, layer: i32, is_on_screen: bool) -> crate::windows::WindowInfo {
+        crate::windows::WindowInfo {
+            window_id,
+            pid: 42,
+            app_name: "osascript".into(),
+            title: String::new(),
+            bounds: crate::windows::WindowBounds {
+                x: 830.,
+                y: 400.,
+                width: 260.,
+                height: 176.,
+            },
+            layer,
+            z_index: 1,
+            is_on_screen,
+            current_space_id: None,
+            on_current_space: None,
+            space_ids: None,
+        }
+    }
+
+    #[test]
+    fn sibling_alerts_without_a_layer_zero_window_remain_ambiguous() {
+        let records = [ax_window(10, Some(false)), ax_window(11, Some(false))];
+        let count = |windows: &[crate::windows::WindowInfo]| {
+            count_competing_keyboard_destinations(
+                42,
+                10,
+                crate::windows::keyboard_destination_rows(windows),
+                &records,
+            )
+        };
+
+        // Two modal alerts (layer 8) of one process count like two layer-0
+        // siblings, so a background key for alert 10 cannot reach alert 11.
+        assert_eq!(count(&[cg_window(10, 8, true), cg_window(11, 8, true)]), 1);
+        assert_eq!(count(&[cg_window(10, 0, true), cg_window(11, 0, true)]), 1);
+        // An off-screen panel or an open menu is not a sibling destination.
+        assert_eq!(count(&[cg_window(10, 8, true), cg_window(11, 8, false)]), 0);
+        assert_eq!(
+            count(&[cg_window(10, 8, true), cg_window(11, 101, true)]),
+            0
         );
     }
 
