@@ -12,13 +12,15 @@ static DEF: std::sync::OnceLock<ToolDef> = std::sync::OnceLock::new();
 fn def() -> &'static ToolDef {
     DEF.get_or_init(|| ToolDef {
         name: "list_windows".into(),
-        description: "List all layer-0 top-level windows currently known to WindowServer. \
-            Includes off-screen windows (minimized, on another Space, hidden-launched). \
+        description: "List all layer-0 top-level windows currently known to WindowServer, \
+            plus on-screen floating windows, modal panels, and system alerts above them \
+            (layer 1-19, such as UserNotificationCenter alerts). \
+            Includes off-screen layer-0 windows (minimized, on another Space, hidden-launched). \
             Use this to find a window_id before calling get_window_state. \
             AppKit-internal helper windows (off screen, untitled, in no Space, and absent \
             from the app's AXWindows) are omitted: no tool can read, move, or focus them.\n\n\
             Per-record fields: window_id, pid, app_name, title, bounds \
-            (x/y/width/height, top-left origin), z_index (integer or null; higher values are \
+            (x/y/width/height, top-left origin), layer (0 for ordinary windows), z_index (integer or null; higher values are \
             closer to the front; null means stacking order is unavailable and callers must not \
             infer one), is_on_screen, space_ids, current_space_id (the active Space on that \
             window's display), and on_current_space. The top-level current_space_id is \
@@ -58,11 +60,7 @@ impl Tool for ListWindowsTool {
         let pid_filter: Option<i32> = args.opt_i64("pid").map(|v| v as i32);
         let on_screen_only = args.bool_or("on_screen_only", false);
 
-        let enumeration = if on_screen_only {
-            crate::windows::visible_windows_with_space_snapshot()
-        } else {
-            crate::windows::all_windows_with_space_snapshot()
-        };
+        let enumeration = crate::windows::listable_windows_with_space_snapshot(on_screen_only);
         let current_space_id = enumeration.current_space_id;
         let mut windows = enumeration.windows;
 
