@@ -17,7 +17,7 @@ use super::bindings::{
     copy_string_attr, focused_element_of_pid, AXUIElementCreateApplication, AXUIElementRef,
 };
 use super::snapshot::RetainedElement;
-use crate::windows::{all_windows, resolve_window_owner, WindowOwner};
+use crate::windows::{live_keyboard_destination_rows, resolve_window_owner, WindowOwner};
 
 /// Bounded `AXParent` ascent used when an element does not expose `AXWindow`.
 const MAX_ANCESTRY_DEPTH: usize = 40;
@@ -178,6 +178,10 @@ unsafe fn ax_window_records(app: AXUIElementRef, pid: i32, window_id: u32) -> Ve
 
 /// Count independently AX-mapped, non-minimized sibling top-level windows.
 ///
+/// `window_server_rows` are the process's windows at every layer, on screen or
+/// not (`crate::windows::keyboard_destination_rows`): two alerts, or a document
+/// and its own alert, are as ambiguous a keyboard target as two documents.
+///
 /// WindowServer may expose several layer-0 compositor surfaces for one native
 /// Electron, Tauri, or WebKit window. A raw same-pid CGWindow row is therefore
 /// not enough to prove another process-scoped keyboard destination. Requiring a
@@ -251,9 +255,7 @@ pub fn gather_background_facts(
     let competing_keyboard_destinations = count_competing_keyboard_destinations(
         pid,
         window_id,
-        all_windows()
-            .iter()
-            .map(|window| (window.pid, window.window_id)),
+        live_keyboard_destination_rows(),
         &records,
     );
 
@@ -356,6 +358,99 @@ mod tests {
         assert_eq!(
             count_competing_keyboard_destinations(42, 10, rows, &records),
             1
+        );
+    }
+
+    fn cg_window(
+        window_id: u32,
+        layer: i32,
+        is_on_screen: bool,
+        width: f64,
+    ) -> crate::windows::WindowInfo {
+        crate::windows::WindowInfo {
+            window_id,
+            pid: 42,
+            app_name: "osascript".into(),
+            title: String::new(),
+            bounds: crate::windows::WindowBounds {
+                x: 830.,
+                y: 400.,
+                width,
+                height: width,
+            },
+            layer,
+            z_index: 1,
+            is_on_screen,
+            current_space_id: None,
+            on_current_space: None,
+            space_ids: None,
+        }
+    }
+
+    /// Competitors for a key aimed at window 10 when windows 10 and 11 are
+    /// both AX-mapped and not minimized.
+    fn mapped_sibling_count(windows: &[crate::windows::WindowInfo]) -> usize {
+        let records = [ax_window(10, Some(false)), ax_window(11, Some(false))];
+        count_competing_keyboard_destinations(
+            42,
+            10,
+            crate::windows::keyboard_destination_rows(windows),
+            &records,
+        )
+    }
+
+    #[test]
+    fn sibling_alerts_without_a_layer_zero_window_remain_ambiguous() {
+        // Two modal alerts (layer 8) of one process count like two layer-0
+        // siblings, so a background key for alert 10 cannot reach alert 11.
+        let alerts = [cg_window(10, 8, true, 260.), cg_window(11, 8, true, 260.)];
+        assert_eq!(mapped_sibling_count(&alerts), 1);
+        let documents = [cg_window(10, 0, true, 260.), cg_window(11, 0, true, 260.)];
+        assert_eq!(mapped_sibling_count(&documents), 1);
+    }
+
+    #[test]
+    fn document_with_its_own_alert_is_ambiguous() {
+        // A key aimed at document 10 could reach its focused modal alert 11.
+        let windows = [cg_window(10, 0, true, 600.), cg_window(11, 8, true, 260.)];
+        assert_eq!(mapped_sibling_count(&windows), 1);
+    }
+
+    #[test]
+    fn mapped_sibling_counts_at_any_layer_size_or_visibility() {
+        // What list_windows hides is no proof a window cannot take the key.
+        for sibling in [
+            cg_window(11, 8, false, 260.),  // off screen
+            cg_window(11, 101, true, 260.), // above layer 19
+            cg_window(11, 1500, true, 260.),
+            cg_window(11, -20, true, 260.),
+            cg_window(11, 8, true, 0.5), // smaller than one point
+        ] {
+            let windows = [cg_window(10, 8, true, 260.), sibling.clone()];
+            assert_eq!(
+                mapped_sibling_count(&windows),
+                1,
+                "layer {} on screen {} width {}",
+                sibling.layer,
+                sibling.is_on_screen,
+                sibling.bounds.width
+            );
+        }
+    }
+
+    #[test]
+    fn unmapped_elevated_window_is_not_a_keyboard_destination() {
+        // An open menu (layer 101) with no AXWindows entry of its own.
+        let records = [ax_window(10, Some(false))];
+        let windows = [cg_window(10, 8, true, 260.), cg_window(11, 101, true, 260.)];
+        assert_eq!(
+            count_competing_keyboard_destinations(
+                42,
+                10,
+                crate::windows::keyboard_destination_rows(&windows),
+                &records,
+            ),
+            0
         );
     }
 

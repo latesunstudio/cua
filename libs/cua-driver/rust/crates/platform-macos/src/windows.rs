@@ -85,6 +85,53 @@ pub(crate) fn visible_windows_with_space_snapshot() -> WindowEnumeration {
     )
 }
 
+/// The windows `list_windows` reports: every layer-0 window, plus the
+/// on-screen floating, modal-panel, and utility windows above them (alerts,
+/// sheets hosted by `UserNotificationCenter`, floating palettes), each with
+/// its real `layer`. `on_screen_only` limits layer-0 windows to the screen too.
+pub(crate) fn listable_windows_with_space_snapshot(on_screen_only: bool) -> WindowEnumeration {
+    let options = if on_screen_only {
+        kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements
+    } else {
+        kCGWindowListExcludeDesktopElements
+    };
+    enumerate_windows(options, LayerFilter::Listable)
+}
+
+/// kCGFloatingWindowLevel through kCGUtilityWindowLevel: floating panels (3),
+/// modal panels and system alerts (8), and utility windows (19). Everything
+/// above starts with the Dock (20), Notification Center (21), and the menu bar
+/// (24), then status items, menus, tooltips, and the cursor: never a window an
+/// agent acts on through `list_windows`. Negative layers are the desktop.
+const LISTABLE_FLOATING_LAYERS: std::ops::RangeInclusive<i32> = 1..=19;
+
+/// Whether `list_windows` admits a window on `layer`. Above layer 0 only
+/// on-screen windows with a real size count: an off-screen or zero-size
+/// floating window is a parked panel no tool can act on.
+fn listable_layer(layer: i32, is_on_screen: bool, bounds: &WindowBounds) -> bool {
+    layer == 0
+        || (LISTABLE_FLOATING_LAYERS.contains(&layer)
+            && is_on_screen
+            && bounds.width >= 1.0
+            && bounds.height >= 1.0)
+}
+
+/// The `(pid, window_id)` rows that may take a process-scoped keystroke:
+/// every window at every layer, on screen or not, of any size. Layer, size,
+/// and visibility decide what `list_windows` shows, not what can become the
+/// key window, so the keyboard guard narrows these only by a fresh `AXWindows`
+/// mapping (see `count_competing_keyboard_destinations`).
+pub(crate) fn keyboard_destination_rows(
+    windows: &[WindowInfo],
+) -> impl Iterator<Item = (i32, u32)> + '_ {
+    windows.iter().map(|w| (w.pid, w.window_id))
+}
+
+/// [`keyboard_destination_rows`] from a fresh WindowServer enumeration.
+pub(crate) fn live_keyboard_destination_rows() -> Vec<(i32, u32)> {
+    keyboard_destination_rows(&all_windows_any_layer()).collect()
+}
+
 /// Enumerate windows on every CGWindow layer, including the accessory layers
 /// (`layer != 0`) that [`all_windows`] hides.
 ///
@@ -111,8 +158,10 @@ pub(crate) fn pointer_hit_windows() -> Vec<WindowInfo> {
 /// Which CGWindow layers an enumeration admits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LayerFilter {
-    /// Normal application windows only — what `list_windows` reports.
+    /// Normal application windows only.
     ZeroOnly,
+    /// What `list_windows` reports; see [`listable_layer`].
+    Listable,
     /// Every layer, accessory windows included.
     AnyLayer,
 }
@@ -128,7 +177,7 @@ fn enumerate_windows(options: u32, layers: LayerFilter) -> WindowEnumeration {
     };
     use std::os::raw::c_void;
 
-    let space_query = (layers == LayerFilter::ZeroOnly)
+    let space_query = (layers != LayerFilter::AnyLayer)
         .then(crate::input::skylight::SpaceQuery::new)
         .flatten();
     let current_space_id = space_query
@@ -244,6 +293,10 @@ fn enumerate_windows(options: u32, layers: LayerFilter) -> WindowEnumeration {
                 })
         };
 
+        if layers == LayerFilter::Listable && !listable_layer(layer, is_on_screen, &bounds) {
+            continue;
+        }
+
         // z_index: CGWindowList front-to-back → assign reverse index.
         let z_index = cua_driver_core::window_target::z_index_from_front_to_back(total, idx);
 
@@ -262,7 +315,7 @@ fn enumerate_windows(options: u32, layers: LayerFilter) -> WindowEnumeration {
         });
     }
 
-    if layers == LayerFilter::ZeroOnly {
+    if layers != LayerFilter::AnyLayer {
         let Some(query) = &space_query else {
             return WindowEnumeration {
                 windows: results,
@@ -581,6 +634,37 @@ mod tests {
             current_space_id: None,
             on_current_space: None,
             space_ids: None,
+        }
+    }
+
+    #[test]
+    fn list_windows_admits_on_screen_alerts_and_floating_panels_only() {
+        let sized = WindowBounds {
+            x: 830.,
+            y: 400.,
+            width: 260.,
+            height: 250.,
+        };
+        let zero = WindowBounds {
+            x: 0.,
+            y: 0.,
+            width: 0.,
+            height: 0.,
+        };
+        // Layer 0 keeps today's rule: off-screen windows stay listed.
+        assert!(listable_layer(0, true, &sized));
+        assert!(listable_layer(0, false, &sized));
+        // UserNotificationCenter alerts and modal panels (8), floating (3),
+        // and utility (19) windows on screen.
+        for layer in [3, 8, 19] {
+            assert!(listable_layer(layer, true, &sized), "layer {layer}");
+            assert!(!listable_layer(layer, false, &sized), "off screen {layer}");
+            assert!(!listable_layer(layer, true, &zero), "zero size {layer}");
+        }
+        // Dock, Notification Center, menu bar, status items, menus, tooltips,
+        // WindowServer indicators, and desktop widgets.
+        for layer in [20, 21, 24, 25, 101, 200, 2147483630, -2147483601] {
+            assert!(!listable_layer(layer, true, &sized), "layer {layer}");
         }
     }
 
