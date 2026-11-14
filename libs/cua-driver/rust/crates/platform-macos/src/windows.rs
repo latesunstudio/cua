@@ -116,16 +116,15 @@ fn listable_layer(layer: i32, is_on_screen: bool, bounds: &WindowBounds) -> bool
             && bounds.height >= 1.0)
 }
 
-/// The `(pid, window_id)` rows that can take a process-scoped keystroke: the
-/// same windows `list_windows` admits, so an alert or modal panel an agent can
-/// find also counts as a sibling that could receive a key meant for another.
+/// The `(pid, window_id)` rows that may take a process-scoped keystroke:
+/// every window at every layer, on screen or not, of any size. Layer, size,
+/// and visibility decide what `list_windows` shows, not what can become the
+/// key window, so the keyboard guard narrows these only by a fresh `AXWindows`
+/// mapping (see `count_competing_keyboard_destinations`).
 pub(crate) fn keyboard_destination_rows(
     windows: &[WindowInfo],
 ) -> impl Iterator<Item = (i32, u32)> + '_ {
-    windows
-        .iter()
-        .filter(|w| listable_layer(w.layer, w.is_on_screen, &w.bounds))
-        .map(|w| (w.pid, w.window_id))
+    windows.iter().map(|w| (w.pid, w.window_id))
 }
 
 /// [`keyboard_destination_rows`] from a fresh WindowServer enumeration.
